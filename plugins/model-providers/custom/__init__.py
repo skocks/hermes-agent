@@ -3,12 +3,16 @@
 Covers any endpoint registered as provider="custom", plus the first-class
 "ollama" provider (routed here by alias), and OpenAI-compatible reasoning
 endpoints (GLM-5.2 on Volcengine ARK, vLLM, llama.cpp). Key quirks:
-  - ollama_num_ctx → extra_body.options.num_ctx (local context window)
-  - ollama_keep_alive → extra_body.keep_alive (model residence time)
-  - reasoning_config disabled → extra_body.think = False
+  - reasoning_config disabled → reasoning_effort "none" on Ollama thinking
+    models (its /v1 disable switch), extra_body.think = False elsewhere
   - reasoning_config enabled + effort → top-level reasoning_effort
     (the native OpenAI-compatible format GLM/ARK expect; unset omits it
     so the endpoint's server default applies)
+
+Ollama's OpenAI-compatible endpoint has no options passthrough: num_ctx
+and keep_alive in the request body are silently dropped, so this profile
+does not emit them. The context window is server-controlled (reconciled
+post-load from /api/ps); keep_alive is refreshed via the native API.
 """
 
 from typing import Any
@@ -24,30 +28,22 @@ class CustomProfile(ProviderProfile):
         self,
         *,
         reasoning_config: dict | None = None,
-        ollama_num_ctx: int | None = None,
-        ollama_keep_alive: int | str | None = None,
         ollama_supports_thinking: bool | None = None,
         **ctx: Any,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
 
-        # Ollama context window
-        if ollama_num_ctx:
-            options = extra_body.get("options", {})
-            options["num_ctx"] = ollama_num_ctx
-            extra_body["options"] = options
-
-        # Ollama model residence time after the request (default 5m). Go
-        # duration string or seconds; -1 = keep loaded until server exit.
-        # Ignored by non-Ollama OpenAI-compatible servers.
-        if ollama_keep_alive is not None:
-            extra_body["keep_alive"] = ollama_keep_alive
-
         # Reasoning / thinking control for custom OpenAI-compatible endpoints
         # (GLM-5.2 on Volcengine ARK, vLLM, Ollama, llama.cpp, …).
         #
-        #   - disabled  → extra_body.think = False (Ollama's thinking-off flag)
+        #   - disabled + Ollama thinking model → TOP-LEVEL reasoning_effort
+        #     "none". Ollama's /v1 handler parses only reasoning_effort and
+        #     maps "none" to think=false internally; an extra_body ``think``
+        #     is an unknown field Go silently drops (verified live: think
+        #     had no effect, effort "none" suppressed reasoning).
+        #   - disabled elsewhere → extra_body.think = False (legacy shape for
+        #     non-Ollama endpoints that do parse it, e.g. ARK).
         #   - enabled + effort set → TOP-LEVEL reasoning_effort string, the
         #     format GLM-5.2/ARK and other OpenAI-compatible reasoning APIs
         #     expect (GLM documents "high" and "max"; "max" is its default).
@@ -74,7 +70,10 @@ class CustomProfile(ProviderProfile):
                 # unknown/non-Ollama and changes nothing.
                 pass
             elif _effort == "none" or _enabled is False:
-                extra_body["think"] = False
+                if ollama_supports_thinking is True:
+                    top_level["reasoning_effort"] = "none"
+                else:
+                    extra_body["think"] = False
             elif _effort:
                 _aliases = {"xhigh": "max", "minimal": "low"}
                 top_level["reasoning_effort"] = _aliases.get(_effort, _effort)

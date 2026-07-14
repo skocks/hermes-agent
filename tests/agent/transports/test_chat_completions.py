@@ -410,16 +410,18 @@ class TestChatCompletionsBuildKwargs:
         # Nous rejects enabled=false; reasoning omitted entirely
         assert "reasoning" not in kw.get("extra_body", {})
 
-    def test_ollama_num_ctx(self, transport):
+    def test_ollama_num_ctx_not_emitted(self, transport):
+        """Ollama /v1 has no options passthrough — emitting num_ctx would be
+        silently dropped, so the transport must not send it at all."""
         from providers import get_provider_profile
         profile = get_provider_profile("custom")
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(
             model="llama3", messages=msgs,
             provider_profile=profile,
-            ollama_num_ctx=32768,
         )
-        assert kw["extra_body"]["options"]["num_ctx"] == 32768
+        assert "options" not in kw.get("extra_body", {})
+        assert "keep_alive" not in kw.get("extra_body", {})
 
     def test_custom_think_false(self, transport):
         from providers import get_provider_profile

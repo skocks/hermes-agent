@@ -976,8 +976,6 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
-            ollama_num_ctx=agent._ollama_num_ctx,
-            ollama_keep_alive=getattr(agent, "_ollama_keep_alive", None),
             ollama_supports_thinking=(
                 agent._ollama_supports_thinking_cached()
                 if (agent.provider or "").strip().lower() == "ollama"
@@ -1023,7 +1021,6 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         is_tokenhub=_is_tokenhub,
         is_lmstudio=_is_lmstudio,
         is_custom_provider=agent.provider == "custom",
-        ollama_num_ctx=agent._ollama_num_ctx,
         provider_preferences=_prefs or None,
         openrouter_min_coding_score=agent.openrouter_min_coding_score,
         qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,

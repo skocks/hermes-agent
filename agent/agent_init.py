@@ -1993,23 +1993,22 @@ def init_agent(
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
     
-    # ── Ollama num_ctx injection ──
-    # Ollama defaults to 2048 context regardless of the model's capabilities.
-    # When running against an Ollama server, detect the model's max context
-    # and pass num_ctx on every chat request so the full window is used.
-    # User override: set model.ollama_num_ctx in config.yaml to cap VRAM use.
-    # If model.context_length is set, it caps num_ctx so the user's VRAM
-    # budget is respected even when GGUF metadata advertises a larger window.
+    # ── Ollama context-window detection ──
+    # Detect the model's own window (a Modelfile num_ctx pin, else the GGUF
+    # trained max) via /api/show. Pre-flight sanity signal ONLY, consumed by
+    # _ollama_context_limit_error: Ollama's OpenAI-compatible /v1 endpoint
+    # ignores per-request num_ctx, so this value is never sent on the wire.
+    # The window the server actually loads is VRAM-sized and reconciled
+    # post-load from /api/ps (sync_ollama_loaded_context).
     agent._ollama_num_ctx: int | None = None
-    _ollama_num_ctx_override = None
-    if isinstance(_model_cfg, dict):
-        _ollama_num_ctx_override = _model_cfg.get("ollama_num_ctx")
-    if _ollama_num_ctx_override is not None:
-        try:
-            agent._ollama_num_ctx = int(_ollama_num_ctx_override)
-        except (TypeError, ValueError):
-            _ra().logger.debug("Invalid ollama_num_ctx config value: %r", _ollama_num_ctx_override)
-    if agent._ollama_num_ctx is None and agent.base_url and is_local_endpoint(agent.base_url):
+    if isinstance(_model_cfg, dict) and _model_cfg.get("ollama_num_ctx") is not None:
+        _ra().logger.warning(
+            "model.ollama_num_ctx has no effect and is ignored: Ollama's "
+            "OpenAI-compatible endpoint drops per-request num_ctx. Set the "
+            "window on the server instead — OLLAMA_CONTEXT_LENGTH env var, "
+            "or PARAMETER num_ctx in a Modelfile."
+        )
+    if agent.base_url and is_local_endpoint(agent.base_url):
         try:
             # ``agent.api_key`` may be a callable (Entra token provider).
             # Ollama detection makes a manual HTTP request and expects a
@@ -2021,32 +2020,14 @@ def init_agent(
                 agent._ollama_num_ctx = _detected
         except Exception as exc:
             _ra().logger.debug("Ollama num_ctx detection failed: %s", exc)
-    # Cap auto-detected ollama_num_ctx to the user's explicit context_length.
-    # Without this, GGUF metadata can advertise 256K+ which Ollama honours
-    # by allocating that much VRAM — blowing up small GPUs even though the
-    # user explicitly set a smaller context_length in config.yaml.
-    if (
-        agent._ollama_num_ctx
-        and _config_context_length
-        and _ollama_num_ctx_override is None  # don't override explicit ollama_num_ctx
-        and agent._ollama_num_ctx > _config_context_length
-    ):
-        _ra().logger.info(
-            "Ollama num_ctx capped: %d -> %d (model.context_length override)",
-            agent._ollama_num_ctx, _config_context_length,
-        )
-        agent._ollama_num_ctx = _config_context_length
-    if agent._ollama_num_ctx and not agent.quiet_mode:
-        _ra().logger.info(
-            "Ollama num_ctx: will request %d tokens (model max from /api/show)",
-            agent._ollama_num_ctx,
-        )
 
     # ── Ollama keep_alive ──
     # How long the server keeps the model resident after a request (Ollama
     # default: 5 minutes). Set model.ollama_keep_alive in config.yaml to a Go
     # duration string ("30m", "2h") or seconds; -1 keeps it loaded until the
-    # server exits. Sent per-request alongside num_ctx.
+    # server exits. The OpenAI-compatible endpoint drops keep_alive from
+    # request bodies, so it is applied via the native API after each response
+    # (sync_ollama_loaded_context).
     agent._ollama_keep_alive = None
     if isinstance(_model_cfg, dict):
         _keep_alive_raw = _model_cfg.get("ollama_keep_alive")

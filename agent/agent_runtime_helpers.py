@@ -2788,6 +2788,124 @@ def intent_ack_continuation_mode(agent) -> str:
     return "codex_only" if agent.api_mode == "codex_responses" else "off"
 
 
+def sync_ollama_loaded_context(agent) -> None:
+    """Reconcile runtime state with the model Ollama actually has loaded.
+
+    Two jobs, both only possible once the model is resident (called after
+    each successful response):
+
+    1. Resize the compressor to the effective context window. Selection
+       shows the trained max (a model property); the server sizes the real
+       window by free VRAM at load time, and the OpenAI-compat /v1 endpoint
+       cannot change it (its request struct has no options field — verified
+       against the Ollama source; a window pinned via the native API is
+       reverted by the next /v1 request). ``/api/ps`` reports the window in
+       effect. Runs BEFORE update_from_response so the calibration reset in
+       update_model is immediately repopulated with this response's usage.
+       An explicit model.context_length override wins unconditionally.
+
+    2. Apply model.ollama_keep_alive through the native API — /v1 drops it
+       for the same reason. One cheap empty /api/generate refreshes the
+       residency timer to the configured duration (idempotent; the model is
+       already loaded, so no work happens server-side).
+    """
+    if (getattr(agent, "provider", "") or "").strip().lower() != "ollama":
+        return
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return
+
+    api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+
+    keep_alive = getattr(agent, "_ollama_keep_alive", None)
+    if keep_alive is not None:
+        _refresh_ollama_keep_alive(agent.model, agent.base_url, api_key or "", keep_alive)
+
+    if getattr(agent, "_config_context_length", None):
+        return
+
+    try:
+        from agent.model_metadata import query_ollama_loaded_context
+
+        # Fresh probe (no cache): this is a status question, the server is
+        # local, and a cached miss from before the load would blind the
+        # sync for the TTL.
+        loaded = query_ollama_loaded_context(
+            agent.model, agent.base_url, api_key=api_key or "", use_cache=False
+        )
+    except Exception:
+        return
+    if not loaded or loaded == getattr(compressor, "context_length", 0):
+        return
+
+    logger.info(
+        "Ollama loaded context: %s runs at %d tokens (was sized %d); "
+        "resizing compressor to the effective window",
+        agent.model, loaded, getattr(compressor, "context_length", 0),
+    )
+    try:
+        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
+        if loaded < MINIMUM_CONTEXT_LENGTH:
+            logger.warning(
+                "Ollama loaded %s with a %d-token window — below the %d "
+                "minimum Hermes needs for reliable agent work. Raise the "
+                "server's window (OLLAMA_CONTEXT_LENGTH env var or a "
+                "Modelfile num_ctx) or expect aggressive compression.",
+                agent.model, loaded, MINIMUM_CONTEXT_LENGTH,
+            )
+    except Exception:
+        pass
+    compressor.update_model(
+        model=agent.model,
+        context_length=loaded,
+        base_url=agent.base_url,
+        api_key=agent.api_key,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+
+
+def _refresh_ollama_keep_alive(model: str, base_url: str, api_key: str, keep_alive) -> None:
+    """Refresh the residency timer via native /api/generate (rate-limited).
+
+    Fire-and-forget: an empty prompt against an already-loaded model is a
+    no-op server-side except for resetting the keep_alive expiry. At most
+    once per 60s per (model, base_url) so busy turn loops don't spam it.
+    """
+    import threading
+    import time as _time
+
+    key = (model, base_url.rstrip("/"))
+    now = _time.monotonic()
+    last = _OLLAMA_KEEP_ALIVE_SENT.get(key, 0.0)
+    if (now - last) < 60.0:
+        return
+    _OLLAMA_KEEP_ALIVE_SENT[key] = now
+
+    def _send() -> None:
+        try:
+            import httpx
+
+            from agent.model_metadata import _auth_headers, _localhost_to_ipv4
+
+            server_url = _localhost_to_ipv4(base_url.rstrip("/"))
+            if server_url.endswith("/v1"):
+                server_url = server_url[:-3]
+            with httpx.Client(timeout=5.0, headers=_auth_headers(api_key)) as client:
+                client.post(
+                    f"{server_url}/api/generate",
+                    json={"model": model, "keep_alive": keep_alive},
+                )
+        except Exception:
+            pass
+
+    threading.Thread(target=_send, daemon=True, name="ollama-keep-alive").start()
+
+
+_OLLAMA_KEEP_ALIVE_SENT: dict = {}
+
+
 def intent_ack_continuation_enabled(agent) -> bool:
     """Whether intent-ack continuation should fire at all for this turn.
 
@@ -3274,6 +3392,7 @@ __all__ = [
     "cleanup_dead_connections",
     "extract_api_error_context",
     "apply_pending_steer_to_tool_results",
+    "sync_ollama_loaded_context",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

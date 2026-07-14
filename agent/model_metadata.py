@@ -1594,6 +1594,79 @@ def query_ollama_supports_thinking(model: str, base_url: str, api_key: str = "")
     return None
 
 
+def query_ollama_loaded_context(
+    model: str, base_url: str, api_key: str = "", use_cache: bool = True
+) -> Optional[int]:
+    """Context window the Ollama server actually loaded ``model`` with.
+
+    ``/api/show`` reports the GGUF trained maximum, but Ollama sizes the
+    real window by free VRAM at load time, and the OpenAI-compat ``/v1``
+    endpoint has no options field — requests cannot change it (a window
+    pinned via the native API is reverted by the next /v1 request).
+    ``/api/ps`` is the only source that reports the window in effect.
+
+    Returns None when the server is unreachable, not Ollama, or the model
+    is not currently loaded. Results are cached briefly (the window only
+    changes on reload, and every /v1 request re-normalizes it to the
+    server default, so it is stable minute-to-minute). Never persisted to
+    the on-disk context cache: this is transient load state, not model
+    metadata.
+    """
+    import time as _time
+
+    import httpx
+
+    bare_model = _strip_provider_prefix(model)
+    if not bare_model or not base_url:
+        return None
+
+    cache_key = ("ollama_ps", bare_model, base_url.rstrip("/"))
+    now = _time.monotonic()
+    if use_cache:
+        cached = _OLLAMA_PS_CACHE.get(cache_key)
+        if cached is not None and (now - cached[1]) < _OLLAMA_PS_TTL_SECONDS:
+            return cached[0]
+
+    server_url = _localhost_to_ipv4(base_url.rstrip("/"))
+    if server_url.endswith("/v1"):
+        server_url = server_url[:-3]
+
+    result: Optional[int] = None
+    try:
+        with httpx.Client(timeout=3.0, headers=_auth_headers(api_key)) as client:
+            resp = client.get(f"{server_url}/api/ps")
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("models")
+                if isinstance(models, list):
+                    base = bare_model.split(":", 1)[0]
+                    for entry in models:
+                        if not isinstance(entry, dict):
+                            continue
+                        name = str(entry.get("name") or entry.get("model") or "")
+                        # Exact tag match; a tagless config value ("gemma4")
+                        # matches any loaded tag of the same base model.
+                        if name == bare_model or (
+                            ":" not in bare_model
+                            and name.split(":", 1)[0] == base
+                        ):
+                            ctx = entry.get("context_length")
+                            if isinstance(ctx, (int, float)) and ctx > 0:
+                                result = int(ctx)
+                                break
+    except Exception:
+        result = None
+
+    _OLLAMA_PS_CACHE[cache_key] = (result, now)
+    return result
+
+
+# Loaded-window probes are re-checked frequently enough to notice an
+# eviction/reload but never on the request hot path more than once a minute.
+_OLLAMA_PS_CACHE: dict = {}
+_OLLAMA_PS_TTL_SECONDS = 60.0
+
+
 def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Optional[int]:
     """Query an Ollama server's native ``/api/show`` for context length.
 
@@ -2280,6 +2353,13 @@ def get_model_context_length(
             # 2b. Ollama native /api/show — any URL might be an Ollama server
             # (local, cloud, or custom hosting).  Non-Ollama servers return
             # 404/405 quickly.  Fall through on failure.
+            #
+            # Deliberately the trained max, NOT the /api/ps loaded window:
+            # selection-time surfaces (picker, /api/model/info, init) show
+            # the model's own property. The loaded window is transient state
+            # reconciled post-load by sync_ollama_loaded_context() — feeding
+            # it here would also fail agent init's minimum-context check for
+            # a model currently resident with a small VRAM-tiered window.
             ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
             if ctx is not None:
                 if not _skip_persistent_context_cache(base_url, provider):

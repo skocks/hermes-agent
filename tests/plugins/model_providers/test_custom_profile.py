@@ -7,12 +7,15 @@ nothing when reasoning was *enabled*, so a configured ``reasoning_effort``
 was silently dropped for every custom endpoint.
 
 These tests pin the wire-shape contract:
-  - disabled            → extra_body.think = False
+  - disabled            → extra_body.think = False (non-Ollama endpoints);
+                          reasoning_effort "none" when the Ollama server
+                          confirmed the model thinks (its /v1 disable switch)
   - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect); OpenAI-only levels
                           (xhigh/minimal) map to the nearest accepted level
   - enabled + no effort → nothing emitted (endpoint's server default applies)
-  - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
+  - num_ctx/keep_alive  → never emitted (Ollama /v1 silently drops them; the
+                          window is reconciled post-load from /api/ps)
 """
 
 from __future__ import annotations
@@ -118,21 +121,58 @@ class TestCustomReasoningWireShape:
         assert eb.get("think") is not True
 
 
-class TestCustomReasoningWithNumCtx:
-    """Ollama num_ctx and reasoning are independent and compose."""
+class TestCustomOllamaThinkingDisable:
+    """Confirmed-thinking Ollama models disable via reasoning_effort 'none'."""
 
-    def test_num_ctx_alone(self, custom_profile):
-        eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config=None, ollama_num_ctx=8192, model="qwen3"
-        )
-        assert eb == {"options": {"num_ctx": 8192}}
-        assert tl == {}
+    def test_disabled_with_thinking_support_sends_effort_none(self, custom_profile):
+        """ollama_supports_thinking=True → reasoning_effort 'none' top-level.
 
-    def test_num_ctx_with_effort(self, custom_profile):
+        Ollama's /v1 handler only parses reasoning_effort ('none' maps to
+        think=false internally); an extra_body think flag is an unknown field
+        Go silently drops. Verified live: think=False had no effect, effort
+        'none' suppressed reasoning.
+        """
         eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "high"},
-            ollama_num_ctx=8192,
+            reasoning_config={"enabled": False},
+            ollama_supports_thinking=True,
             model="qwen3",
         )
-        assert eb == {"options": {"num_ctx": 8192}}
+        assert tl == {"reasoning_effort": "none"}
+        assert eb == {}
+
+    def test_effort_none_with_thinking_support_sends_effort_none(self, custom_profile):
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "none"},
+            ollama_supports_thinking=True,
+            model="qwen3",
+        )
+        assert tl == {"reasoning_effort": "none"}
+        assert eb == {}
+
+    def test_no_thinking_support_emits_nothing(self, custom_profile):
+        """ollama_supports_thinking=False → emit no reasoning fields at all.
+
+        Ollama 400s on reasoning_effort (any value) for non-thinking models;
+        a session's effort dial carried over from a thinking model must not
+        brick the chat.
+        """
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            ollama_supports_thinking=False,
+            model="hermes3:8b",
+        )
+        assert eb == {}
+        assert tl == {}
+
+
+class TestCustomOllamaNoOptionsPassthrough:
+    """Ollama /v1 silently drops options/keep_alive — never emit them."""
+
+    def test_request_body_has_no_ollama_options(self, custom_profile):
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="qwen3",
+        )
+        assert "options" not in eb
+        assert "keep_alive" not in eb
         assert tl == {"reasoning_effort": "high"}

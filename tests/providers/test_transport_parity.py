@@ -285,17 +285,22 @@ class TestQwenParity:
 
 
 class TestCustomOllamaParity:
-    """Custom/Ollama: num_ctx, thinking controls — now tested via profile."""
+    """Custom/Ollama: request-body contract — now tested via profile.
 
-    def test_ollama_num_ctx(self, transport):
+    Ollama's OpenAI-compatible endpoint has no options passthrough, so the
+    transport must NOT emit num_ctx/keep_alive (they'd be silently dropped;
+    the window is reconciled post-load from /api/ps instead).
+    """
+
+    def test_no_ollama_options_in_request_body(self, transport):
         kw = transport.build_kwargs(
             model="llama3.1",
             messages=_simple_messages(),
             tools=None,
             provider_profile=get_provider_profile("custom"),
-            ollama_num_ctx=131072,
         )
-        assert kw["extra_body"]["options"]["num_ctx"] == 131072
+        assert "options" not in kw.get("extra_body", {})
+        assert "keep_alive" not in kw.get("extra_body", {})
 
     def test_think_false_when_disabled(self, transport):
         kw = transport.build_kwargs(
@@ -306,3 +311,17 @@ class TestCustomOllamaParity:
             reasoning_config={"enabled": False, "effort": "none"},
         )
         assert kw["extra_body"]["think"] is False
+
+    def test_effort_none_on_ollama_thinking_model(self, transport):
+        """A confirmed-thinking Ollama model disables via reasoning_effort
+        'none' — the only switch its /v1 handler parses (think is dropped)."""
+        kw = transport.build_kwargs(
+            model="qwen3:72b",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("custom"),
+            reasoning_config={"enabled": False, "effort": "none"},
+            ollama_supports_thinking=True,
+        )
+        assert kw["reasoning_effort"] == "none"
+        assert "think" not in kw.get("extra_body", {})

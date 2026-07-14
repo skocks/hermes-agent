@@ -32,7 +32,6 @@ class TestNvidiaProfileWiring:
             reasoning_config=None,
             request_overrides=None,
             session_id="test",
-            ollama_num_ctx=None,
         )
         # NVIDIA profile sets default_max_tokens=16384
         assert kwargs.get("max_tokens") == 16384
@@ -56,7 +55,6 @@ class TestNvidiaProfileWiring:
             reasoning_config=None,
             request_overrides=None,
             session_id="test",
-            ollama_num_ctx=None,
         )
         assert kwargs["model"] == "nvidia/test-model"
 
@@ -74,7 +72,6 @@ class TestNvidiaProfileWiring:
             reasoning_config=None,
             request_overrides=None,
             session_id="test",
-            ollama_num_ctx=None,
         )
         assert kwargs["messages"] == msgs
 
@@ -93,7 +90,6 @@ class TestDeepSeekProfileWiring:
             reasoning_config=None,
             request_overrides=None,
             session_id="test",
-            ollama_num_ctx=None,
         )
         # DeepSeek has no default_max_tokens
         assert kwargs["model"] == "deepseek-chat"
@@ -113,6 +109,5 @@ class TestDeepSeekProfileWiring:
             reasoning_config=None,
             request_overrides=None,
             session_id="test",
-            ollama_num_ctx=None,
         )
         assert kwargs["messages"] == msgs

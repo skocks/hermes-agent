@@ -143,12 +143,12 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
         f"Ollama loaded `{model}` with only {runtime_ctx:,} tokens of runtime "
         f"context, but Hermes needs at least {MINIMUM_CONTEXT_LENGTH:,} tokens "
         "for reliable tool use.\n\n"
-        "Increase the Ollama context for this model and restart/reload the "
-        "model before trying again. A known-good starting point is 65,536 "
-        "tokens. In Hermes config, set `model.ollama_num_ctx: 65536` "
-        "(and `model.context_length: 65536` if you also override the displayed "
-        "model context). If you manage the model through an Ollama Modelfile, "
-        "set `PARAMETER num_ctx 65536` there instead."
+        "Increase the Ollama context for this model and reload it before "
+        "trying again. A known-good starting point is 65,536 tokens: set "
+        "`OLLAMA_CONTEXT_LENGTH=65536` in the Ollama server's environment "
+        "and restart it, or set `PARAMETER num_ctx 65536` in the model's "
+        "Modelfile. (Ollama's OpenAI-compatible API ignores per-request "
+        "num_ctx, so this cannot be fixed from the client side.)"
     )
 
 
@@ -2118,6 +2118,15 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    # Reconcile with the window Ollama actually loaded before
+                    # the usage update: the /v1 endpoint cannot pin num_ctx,
+                    # so the served window (VRAM-tiered) is discoverable only
+                    # now that the model is resident. No-op for other providers.
+                    try:
+                        from agent.agent_runtime_helpers import sync_ollama_loaded_context
+                        sync_ollama_loaded_context(agent)
+                    except Exception as _ollama_sync_exc:  # pragma: no cover - defensive
+                        logger.debug("Ollama loaded-context sync failed: %s", _ollama_sync_exc)
                     agent.context_compressor.update_from_response(usage_dict)
                 elif getattr(
                     agent.context_compressor,

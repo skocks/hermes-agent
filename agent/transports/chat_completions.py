@@ -307,8 +307,6 @@ class ChatCompletionsTransport(ProviderTransport):
             is_tokenhub: bool
             is_lmstudio: bool
             is_custom_provider: bool
-            ollama_num_ctx: int | None
-            ollama_keep_alive: int | str | None
             ollama_supports_thinking: bool | None
             # Provider routing
             provider_preferences: dict | None
@@ -587,8 +585,6 @@ class ChatCompletionsTransport(ProviderTransport):
                 qwen_session_metadata=params.get("qwen_session_metadata"),
                 model=model,
                 base_url=params.get("base_url"),
-                ollama_num_ctx=params.get("ollama_num_ctx"),
-                ollama_keep_alive=params.get("ollama_keep_alive"),
                 ollama_supports_thinking=params.get("ollama_supports_thinking"),
                 session_id=params.get("session_id"),
             )
