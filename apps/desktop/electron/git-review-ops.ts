@@ -46,6 +46,27 @@ function gitFor(cwd, gitBin) {
   return simpleGit({ baseDir: cwd, binary: gitBin || 'git', maxConcurrentProcesses: 4, trimmed: false })
 }
 
+// simple-git returns paths relative to the git repo root, but the renderer
+// expects them relative to the requested cwd (which may be a subdirectory of
+// the repo). Resolve the repo root once per call, then re-base each path.
+// gitBin is threaded (not discarded) so Windows PortableGit — resolved in the
+// main process and deliberately NOT on PATH — is used for the toplevel probe.
+async function repoRoot(cwd, gitBin) {
+  try {
+    return (await gitFor(cwd, gitBin).revparse(['--show-toplevel'])).trim()
+  } catch {
+    return cwd
+  }
+}
+
+function rebasePath(root, cwd, repoRelativePath) {
+  if (!root || !cwd || !repoRelativePath) {
+    return repoRelativePath
+  }
+
+  return path.relative(cwd, path.join(root, repoRelativePath))
+}
+
 // simple-git reports renames as `old => new` (and `dir/{old => new}/f`); resolve
 // to the NEW path so the row addresses the real file for diff/stage.
 function resolveRenamePath(raw) {
@@ -239,9 +260,10 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
 
       const range = scope === 'branch' ? `${base}...HEAD` : base
       const summary = await git.diffSummary([range])
+      const root = await repoRoot(cwd, gitBin)
 
       const files = summary.files.map(file => ({
-        path: resolveRenamePath(file.file),
+        path: rebasePath(root, cwd, resolveRenamePath(file.file)),
         added: 'insertions' in file ? file.insertions : 0,
         removed: 'deletions' in file ? file.deletions : 0,
         status: 'M',
@@ -252,9 +274,11 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
       if (scope === 'lastTurn') {
         const status = await git.status()
 
-        for (const path of status.not_added) {
-          if (!files.some(f => f.path === path)) {
-            files.push({ path, added: 0, removed: 0, status: '?', staged: false })
+        for (const entry of status.not_added) {
+          const rp = rebasePath(root, cwd, entry)
+
+          if (!files.some(f => f.path === rp)) {
+            files.push({ path: rp, added: 0, removed: 0, status: '?', staged: false })
           }
         }
       }
@@ -274,11 +298,14 @@ async function reviewList(repoPath, scope, baseRef, gitBin) {
 
     const stagedCounts = countsByPath(staged)
     const unstagedCounts = countsByPath(unstaged)
+    const root = await repoRoot(cwd, gitBin)
 
     const files = status.files.map(file => {
-      const filePath = resolveRenamePath(file.path)
-      const sc = stagedCounts.get(filePath) || { added: 0, removed: 0 }
-      const uc = unstagedCounts.get(filePath) || { added: 0, removed: 0 }
+      const filePath = rebasePath(root, cwd, resolveRenamePath(file.path))
+      // countsByPath keys are root-relative (from simple-git's diffSummary),
+      // so look up with the original (pre-rebase) path.
+      const sc = stagedCounts.get(resolveRenamePath(file.path)) || { added: 0, removed: 0 }
+      const uc = unstagedCounts.get(resolveRenamePath(file.path)) || { added: 0, removed: 0 }
 
       return {
         path: filePath,
@@ -677,6 +704,7 @@ async function repoStatus(repoPath, gitBin) {
 export {
   branchBase,
   fileDiffVsHead,
+  rebasePath,
   repoStatus,
   resolveRenamePath,
   reviewCommit,
