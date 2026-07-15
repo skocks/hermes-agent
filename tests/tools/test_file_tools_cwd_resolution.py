@@ -477,11 +477,126 @@ def test_preserved_cwd_does_not_override_non_owning_sessions_worktree(
     wt_a, wt_b, _main = _two_worktree_sessions
     monkeypatch.setattr(ft, "_last_known_cwd", {})
 
-    # Owner B resolves first — this mirrors wt_b into _last_known_cwd['default'].
+    # Owner B resolves first — this mirrors wt_b into _last_known_cwd['default']
+    # (owner-tagged with sess-b so other sessions can't inherit it).
     assert ft._resolve_path_for_task("target.py", task_id="sess-b") == (wt_b / "target.py")
-    assert ft._last_known_cwd.get("default") == str(wt_b)
+    assert ft._last_known_cwd.get("default") == (str(wt_b), "sess-b")
 
     # A still routes to its own registered worktree despite the shared anchor.
     resolved_a = ft._resolve_path_for_task("target.py", task_id="sess-a")
     assert resolved_a == (wt_a / "target.py")
     assert not str(resolved_a).startswith(str(wt_b))
+
+
+# ── Fix E: unowned/default-owned shared cwd must not beat a registered override ─
+# (July 2026: the shared env's cwd_owner is stamped "" or "default" whenever it
+# is driven without a session key — a top-level CLI turn, a cron tick. The
+# ownership guard treated that as "trusted by everyone", and since the live cwd
+# is rung 1 of the resolution ladder it outranked the resolving session's OWN
+# registered worktree override. Sibling leak: _last_known_cwd entries carried no
+# owner at all, so a session with no anchor of its own inherited whatever
+# directory the LAST session navigated to.)
+
+
+def test_default_owned_live_cwd_does_not_beat_registered_override(
+    _two_worktree_sessions, monkeypatch
+):
+    """An env last driven without a session key must not hijack a registered worktree."""
+    wt_a, wt_b, _main = _two_worktree_sessions
+    monkeypatch.setattr(ft, "_last_known_cwd", {})
+    # Shared env re-stamped by a session-key-less driver (CLI turn / cron tick),
+    # its cwd pointing at some other checkout.
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": _FakeOwnedEnv(str(wt_b), "default")},
+    )
+    resolved = ft._resolve_path_for_task("target.py", task_id="sess-a")
+    assert resolved == (wt_a / "target.py")
+    assert not str(resolved).startswith(str(wt_b))
+
+
+def test_empty_owned_live_cwd_does_not_beat_registered_override(
+    _two_worktree_sessions, monkeypatch
+):
+    """Same leak with owner stamped '' (get_current_session_key default)."""
+    wt_a, wt_b, _main = _two_worktree_sessions
+    monkeypatch.setattr(ft, "_last_known_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": _FakeOwnedEnv(str(wt_b), "")},
+    )
+    resolved = ft._resolve_path_for_task("target.py", task_id="sess-a")
+    assert resolved == (wt_a / "target.py")
+    assert not str(resolved).startswith(str(wt_b))
+
+
+def test_unowned_live_cwd_still_wins_without_registered_override(tmp_path, monkeypatch):
+    """Single-session CLI behavior unchanged: no override → unowned live cwd is used."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(ft, "_file_ops_cache", {})
+    monkeypatch.setattr(ft, "_last_known_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": _FakeOwnedEnv(str(ws), "")},
+    )
+    assert ft._resolve_path_for_task("target.py", task_id="some-session") == (ws / "target.py")
+
+
+def test_preserved_cwd_does_not_leak_to_session_without_any_anchor(
+    _two_worktree_sessions, monkeypatch
+):
+    """A preserved anchor recorded by session B must not be handed to session C.
+
+    Session C has NO live cwd, NO registered override — before the fix it fell
+    through to _last_known_cwd['default'] and inherited B's worktree.
+    Now the owner-tagged entry is refused and C falls back to the process cwd.
+    """
+    wt_a, wt_b, main = _two_worktree_sessions
+    monkeypatch.setattr(ft, "_last_known_cwd", {})
+
+    # B (owner) does a live read → mirrors wt_b into the shared registry.
+    assert ft._resolve_path_for_task("x.py", task_id="sess-b") == (wt_b / "x.py")
+    # Env cleaned up.
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+
+    # C: not registered, never drove the env. Must NOT inherit wt_b.
+    resolved = ft._resolve_path_for_task("target.py", task_id="sess-c")
+    assert not str(resolved).startswith(str(wt_b))
+    assert resolved == (main / "target.py").resolve()
+
+    # B itself still gets its preserved anchor back (that's the #26211 fix).
+    assert ft._resolve_path_for_task("y.py", task_id="sess-b") == (wt_b / "y.py")
+
+
+def test_default_task_still_reads_preserved_cwd(tmp_path, monkeypatch):
+    """#26211 unchanged for the single-session default task."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(ft, "_file_ops_cache", {})
+    monkeypatch.setattr(ft, "_last_known_cwd", {})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+
+    ft._remember_last_known_cwd("default", str(ws), owner="default")
+    assert ft._resolve_path_for_task("target.py", task_id="default") == (ws / "target.py")
+
+
+def test_legacy_bare_string_registry_entry_still_readable(tmp_path, monkeypatch):
+    """Old-format bare-string entries are treated as session-agnostic."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(ft, "_file_ops_cache", {})
+    monkeypatch.setattr(ft, "_last_known_cwd", {"default": str(ws)})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    assert ft._last_known_cwd_for("default") == str(ws)
+    assert ft._last_known_cwd_for("any-session") == str(ws)

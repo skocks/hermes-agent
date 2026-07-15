@@ -797,8 +797,8 @@ class TestLastKnownCwd:
         live = _get_live_tracking_cwd(task_id)
 
         assert live == "/Users/user/project"
-        # The read mirrored the live cwd into the durable registry.
-        assert _last_known_cwd.get(task_id) == "/Users/user/project"
+        # The read mirrored the live cwd into the durable registry (owner-tagged).
+        assert _last_known_cwd.get(task_id) == ("/Users/user/project", "default")
         _last_known_cwd.pop(task_id, None)
 
     @patch("tools.terminal_tool._active_environments", new_callable=dict)
@@ -828,7 +828,7 @@ class TestLastKnownCwd:
         cached.env.cwd_owner = "default"
         mock_cache[task_id] = cached
         assert _get_live_tracking_cwd(task_id) == "/Users/user/project"
-        assert _last_known_cwd.get(task_id) == "/Users/user/project"
+        assert _last_known_cwd.get(task_id) == ("/Users/user/project", "default")
 
         # 2) Cleanup thread kills the env AND clears the cache before the next
         #    file write — so _get_file_ops' save-old-cwd branch never runs.

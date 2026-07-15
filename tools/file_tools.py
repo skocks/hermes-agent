@@ -269,7 +269,7 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
-def _live_cwd_if_owned(env, task_id: str) -> str | None:
+def _live_cwd_if_owned(env, task_id: str, strict: bool = False) -> str | None:
     """The env's live cwd, but only when THIS session owns it.
 
     The terminal env is shared (collapsed to the ``"default"`` container), so its
@@ -280,6 +280,13 @@ def _live_cwd_if_owned(env, task_id: str) -> str | None:
     only when that owner matches the resolving session, else ``None`` so the
     caller falls through to this session's own registered cwd override. Unknown
     owner / ``default`` keys keep the prior behavior (single-session / CLI).
+
+    ``strict=True`` requires the owner to be EXACTLY the resolving session —
+    an unowned or ``"default"``-owned cwd is rejected too. Used when the
+    resolving session has its own registered workspace override: a shared env
+    last driven without a session key (top-level CLI turn, cron tick) is
+    stamped ``""``/``"default"`` and must not outrank the session's own
+    registered worktree.
     """
     if env is None:
         return None
@@ -288,13 +295,20 @@ def _live_cwd_if_owned(env, task_id: str) -> str | None:
         return None
     owner = str(getattr(env, "cwd_owner", "") or "")
     tid = str(task_id or "")
+    if strict:
+        return live if (owner and owner == tid) else None
     if owner and tid and owner != "default" and tid != "default" and owner != tid:
         return None
     return live
 
 
-def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
-    """Return the task's live terminal cwd for bookkeeping when available."""
+def _get_live_tracking_cwd(task_id: str = "default", strict: bool = False) -> str | None:
+    """Return the task's live terminal cwd for bookkeeping when available.
+
+    ``strict`` is forwarded to :func:`_live_cwd_if_owned` — when the resolving
+    session has its own registered workspace override, only an env explicitly
+    owned by that exact session may outrank it.
+    """
     try:
         from tools.terminal_tool import _resolve_container_task_id
         container_key = _resolve_container_task_id(task_id)
@@ -305,14 +319,15 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
         cached = _file_ops_cache.get(container_key) or _file_ops_cache.get(task_id)
     if cached is not None:
         env = getattr(cached, "env", None)
-        live_cwd = _live_cwd_if_owned(env, task_id)
+        live_cwd = _live_cwd_if_owned(env, task_id, strict=strict)
         if live_cwd:
-            _remember_last_known_cwd(container_key, live_cwd)
+            _remember_last_known_cwd(container_key, live_cwd, owner=task_id)
             return live_cwd
         # Legacy: a cache entry carrying its own cwd with no env to own it.
-        if env is None and getattr(cached, "cwd", None):
+        # An ownerless legacy cwd can't satisfy strict ownership.
+        if not strict and env is None and getattr(cached, "cwd", None):
             legacy_cwd = getattr(cached, "cwd", None)
-            _remember_last_known_cwd(container_key, legacy_cwd)
+            _remember_last_known_cwd(container_key, legacy_cwd, owner=task_id)
             return legacy_cwd
 
     try:
@@ -320,9 +335,9 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
 
         with _env_lock:
             env = _active_environments.get(container_key) or _active_environments.get(task_id)
-        live_cwd = _live_cwd_if_owned(env, task_id)
+        live_cwd = _live_cwd_if_owned(env, task_id, strict=strict)
         if live_cwd:
-            _remember_last_known_cwd(container_key, live_cwd)
+            _remember_last_known_cwd(container_key, live_cwd, owner=task_id)
             return live_cwd
     except Exception:
         pass
@@ -345,8 +360,6 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     case callers fall back to the process cwd.
     """
     live = _get_live_tracking_cwd(task_id)
-    if live:
-        return live
     # A session-specific registered override (TUI/Desktop/ACP workspace cwd)
     # is more authoritative than the shared last-known anchor: it is keyed by
     # the raw session id, so when two worktree sessions share the single
@@ -354,6 +367,15 @@ def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     # registered worktree — never the other session's leftover cwd. (Checked
     # before _last_known_cwd, which is keyed by the shared container id.)
     registered = _registered_task_cwd_override(task_id)
+    if live and registered:
+        # Both anchors exist: the shared env's live cwd may only outrank this
+        # session's own registered worktree when the env is owned by EXACTLY
+        # this session. An unowned/"default"-owned cwd (last driven by a
+        # top-level CLI turn or cron tick with no session key) is some other
+        # context's leftover `cd` — the registered override wins.
+        live = _get_live_tracking_cwd(task_id, strict=True)
+    if live:
+        return live
     if registered:
         return registered
     # When the terminal env was cleaned up mid-conversation, the live cwd is
@@ -797,10 +819,15 @@ _file_ops_cache: dict = {}
 # Per-task last-known CWD — preserved across env re-creation so
 # relative-path file writes land in the right directory after the
 # terminal environment is cleaned up and rebuilt (root cause of #26211).
+# Values are ``(cwd, owner)`` tuples: the registry is keyed by the shared
+# container id (usually "default"), so without an owner tag any session
+# would inherit whatever directory the LAST session navigated to — the
+# cross-session leak. ``owner`` is the raw session/task id that produced
+# the cwd ("default" for single-session/CLI, which every session may use).
 _last_known_cwd: dict = {}
 
 
-def _remember_last_known_cwd(task_id: str, cwd: str | None) -> None:
+def _remember_last_known_cwd(task_id: str, cwd: str | None, owner: str | None = None) -> None:
     """Mirror a live terminal cwd into the durable ``_last_known_cwd`` registry.
 
     Belt-and-suspenders for #26211: the cleanup thread can pop BOTH
@@ -811,12 +838,29 @@ def _remember_last_known_cwd(task_id: str, cwd: str | None) -> None:
     read (which happens on every relative-path file resolution while the env is
     alive), the durable anchor no longer depends on the cleanup-detection
     branch firing, so it survives recreation regardless of pop ordering.
+
+    ``owner`` tags the entry with the session that produced the cwd so the
+    read side (:func:`_last_known_cwd_for`) can refuse to hand one session's
+    preserved directory to a different session.
     """
     if not cwd:
         return
+    entry = (cwd, str(owner or task_id or "default"))
     with _file_ops_lock:
-        if _last_known_cwd.get(task_id) != cwd:
-            _last_known_cwd[task_id] = cwd
+        if _last_known_cwd.get(task_id) != entry:
+            _last_known_cwd[task_id] = entry
+
+
+def _last_known_cwd_entry(key: str) -> tuple[str, str] | None:
+    """Read a raw registry entry, tolerating legacy bare-string values."""
+    value = _last_known_cwd.get(key)
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return value
+    # Legacy bare-string entry (written by older code / direct test presets):
+    # no owner recorded — treat as session-agnostic, matching prior behavior.
+    return (value, "default")
 
 
 def _last_known_cwd_for(task_id: str = "default") -> str | None:
@@ -825,14 +869,28 @@ def _last_known_cwd_for(task_id: str = "default") -> str | None:
     The registry is keyed by the resolved container id (the same key used by
     the save sites in ``_get_file_ops`` / ``_get_live_tracking_cwd``), so look
     up the resolved key first and fall back to the raw task id.
+
+    Ownership guard: an entry is returned only when it was produced by THIS
+    session, or is session-agnostic (owner ``"default"``, i.e. single-session
+    CLI / legacy). A preserved cwd recorded by a *different* session must not
+    leak here — the whole point of the shared-container key is convenience,
+    not shared workspace state.
     """
     try:
         from tools.terminal_tool import _resolve_container_task_id
         container_key = _resolve_container_task_id(task_id)
     except Exception:
         container_key = task_id
+    tid = str(task_id or "default")
     with _file_ops_lock:
-        return _last_known_cwd.get(container_key) or _last_known_cwd.get(task_id)
+        for key in (container_key, task_id):
+            entry = _last_known_cwd_entry(key)
+            if entry is None:
+                continue
+            cwd, owner = entry
+            if owner == "default" or tid == "default" or owner == tid:
+                return cwd
+        return None
 
 # Track files read per task to detect re-read loops and deduplicate reads.
 # Per task_id we store:
@@ -1074,8 +1132,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 # file-creation failures in long-running conversations).
                 old_cwd = getattr(cached, "cwd", None)
                 if old_cwd:
-                    with _file_ops_lock:
-                        _last_known_cwd[task_id] = old_cwd
+                    _remember_last_known_cwd(task_id, old_cwd, owner=raw_task_id)
                 with _file_ops_lock:
                     _file_ops_cache.pop(task_id, None)
 
@@ -1113,7 +1170,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             else:
                 image = ""
 
-            cwd = overrides.get("cwd") or _last_known_cwd.get(task_id) or config["cwd"]
+            cwd = overrides.get("cwd") or _last_known_cwd_for(raw_task_id) or config["cwd"]
             # Re-apply the container cwd guard that _get_env_config() already
             # ran on config["cwd"] (see #50636).  A per-task cwd override
             # registered by the gateway/TUI/ACP for workspace tracking is a
