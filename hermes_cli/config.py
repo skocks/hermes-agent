@@ -7846,6 +7846,20 @@ def _quote_env_value(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _env_line_defines_key(line: str, key: str) -> bool:
+    """True when a .env line assigns ``key`` — plain or ``export``-prefixed.
+
+    ``load_env()`` accepts the bash-compatible ``export KEY=value`` form
+    (#6659), so the writers must recognise the same shape. Otherwise a
+    hand-added ``export`` line is invisible to save (duplicate appended) and
+    remove (line survives → the value resurrects on the next load, #40041).
+    """
+    stripped = line.strip()
+    if stripped.startswith("export "):
+        stripped = stripped[7:].lstrip()
+    return stripped.startswith(f"{key}=")
+
+
 def save_env_value(key: str, value: str):
     """Save or update a value in ~/.hermes/.env."""
     if is_managed():
@@ -7887,10 +7901,15 @@ def save_env_value(key: str, value: str):
 
     serialized_value = _quote_env_value(value)
 
-    # Find and update or append
+    # Find and update or append. Match both ``KEY=`` and the bash-compatible
+    # ``export KEY=`` form — load_env() parses export lines (#6659), so a
+    # user-added ``export GITHUB_TOKEN=...`` shows as set in every UI. If the
+    # writer didn't match it, a save would append a SECOND line and a later
+    # delete of that line would silently resurrect the old exported value
+    # (#40041: "token detected but cannot be replaced through the UI").
     found = False
     for i, line in enumerate(lines):
-        if line.strip().startswith(f"{key}="):
+        if _env_line_defines_key(line, key):
             lines[i] = f"{key}={serialized_value}\n"
             found = True
             break
@@ -7969,7 +7988,7 @@ def remove_env_value(key: str) -> bool:
         lines = f.readlines()
     lines = _sanitize_env_lines(lines)
 
-    new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
+    new_lines = [line for line in lines if not _env_line_defines_key(line, key)]
     found = len(new_lines) < len(lines)
 
     if found:
