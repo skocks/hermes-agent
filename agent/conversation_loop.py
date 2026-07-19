@@ -76,6 +76,34 @@ from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
 
+
+# Forward-looking "I'll do X now" intent with no accompanying tool call.
+# Guards the "narrate-then-stop" stall: the model closes its reasoning,
+# states intent ("Let me now translate it…"), and hits the stop token
+# without emitting a <tool_call>, yielding a stalled turn. (#translate-stall)
+_DANGLING_INTENT_RE = re.compile(
+    r"\b(?:let me|i'?ll|i will|now i'?ll|next[,: ]|let's|"
+    r"allow me to|going to|about to)\b[^?]*$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_dangling_intent(text: str) -> bool:
+    """True when the last line announces a next action but no tool ran.
+
+    A trailing '?' means a genuine hand-back to the user, so it never matches.
+    Only the final line is inspected — mid-message intent is fine as long as
+    the message ends on a real statement or result.
+    """
+    if not text:
+        return False
+    tail = text.strip()
+    if not tail or tail.endswith("?"):
+        return False
+    last = re.split(r"[\r\n]+", tail)[-1].strip()
+    return bool(_DANGLING_INTENT_RE.search(last))
+
+
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
@@ -5495,6 +5523,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_dangling_intent_synthetic")
                     )
                 ):
                     messages.pop()
@@ -5652,8 +5681,52 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # Dangling-intent gate: the general-case complement to the
+                # kanban guard above. In a normal (non-kanban) session the
+                # model may announce its next action ("Let me now translate
+                # it…") but produce no tool call and stop — the kanban guard
+                # is inert here (HERMES_KANBAN_TASK unset), so this catches it.
+                # Nudge once to actually execute instead of handing a stalled
+                # turn back to the user. Mirrors the verify-on-stop /
+                # pre_verify one-more-turn contract above. (#translate-stall)
+                if (
+                    finish_reason == "stop"
+                    and not getattr(assistant_message, "tool_calls", None)
+                    and getattr(agent, "_dangling_intent_nudges", 0) < 1
+                    and _looks_like_dangling_intent(final_response)
+                ):
+                    agent._dangling_intent_nudges = (
+                        getattr(agent, "_dangling_intent_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "dangling_intent_continue"
+                    final_msg["_dangling_intent_synthetic"] = True
+                    logger.info(
+                        "Dangling-intent stall — announced an action but emitted "
+                        "no tool call; nudging to execute. tail=%r",
+                        (final_response or "")[-160:],
+                    )
+                    agent._buffer_status(
+                        "⚠️ Model described the next step but didn't run it — "
+                        "nudging to execute"
+                    )
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You described the next action but did not emit the "
+                            "corresponding tool call, and the turn stopped. Do "
+                            "not re-explain — issue the tool call now to carry "
+                            "out exactly what you just said you would do."
+                        ),
+                        "_dangling_intent_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    _pending_verification_response = final_response
+                    final_response = None
+                    continue
+
                 messages.append(final_msg)
-                
+
                 _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
                 if not agent.quiet_mode:
                     agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")

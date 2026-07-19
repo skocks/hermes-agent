@@ -23,6 +23,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -542,9 +543,21 @@ def finalize_turn(
     )
 
     # Background memory/skill review — runs AFTER the response is delivered
-    # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    # so it never competes with the user's task for model attention. Debounced
+    # so the interval trigger can't fire mid-operation: a rapid multi-turn task
+    # (rename → rename → translate) triggers the review at most once, at the
+    # tail, instead of interrupting the middle and spinning a review fork.
+    # (#translate-stall)
+    _REVIEW_COOLDOWN_S = 300
+    _now = time.monotonic()
+    _last_review = getattr(agent, "_last_background_review_ts", 0.0)
+    _review_on_cooldown = (_now - _last_review) < _REVIEW_COOLDOWN_S
+
+    if (final_response and not interrupted
+            and (_should_review_memory or _should_review_skills)
+            and not _review_on_cooldown):
         try:
+            agent._last_background_review_ts = _now
             agent._spawn_background_review(
                 messages_snapshot=list(messages),
                 review_memory=_should_review_memory,
@@ -552,6 +565,11 @@ def finalize_turn(
             )
         except Exception:
             pass  # Background review is best-effort
+    elif _review_on_cooldown and (_should_review_memory or _should_review_skills):
+        logger.debug(
+            "Background review suppressed — %.0fs since last (cooldown %ds)",
+            _now - _last_review, _REVIEW_COOLDOWN_S,
+        )
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

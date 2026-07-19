@@ -711,7 +711,11 @@ def _run_review_in_thread(
                 _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
-                max_iterations=16,
+                # Capped low: memory/skill review is a bounded write task, not
+                # open-ended work. A tight ceiling stops a rejected memory write
+                # (e.g. a threat-pattern-blocked path) from spinning the fork
+                # through retry after retry. (#translate-stall)
+                max_iterations=6,
                 quiet_mode=True,
                 platform=agent.platform,
                 provider=_rt.get("provider") or agent.provider,
