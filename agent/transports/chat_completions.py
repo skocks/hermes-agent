@@ -496,6 +496,27 @@ class ChatCompletionsTransport(ProviderTransport):
             elif raw_thinking_config:
                 extra_body["thinking_config"] = raw_thinking_config
 
+        # Generic thinking toggle for OpenAI-compatible endpoints whose chat
+        # template gates reasoning on an `enable_thinking` variable (e.g. Qwen
+        # served by TabbyAPI/vLLM), which honor no graduated reasoning_effort.
+        # Branded providers above own their reasoning wire, and models with a
+        # dedicated provider profile emit this via build_api_kwargs_extras — so
+        # only the plain custom/local path needs it here. Emit ONLY the disable
+        # case, so default (thinking-on) behavior is untouched, and via
+        # extra_body so it lands in the request body without tripping the
+        # OpenAI SDK's typed-param validation. TabbyAPI maps a top-level
+        # enable_thinking straight onto the template variable.
+        if (
+            isinstance(reasoning_config, dict)
+            and reasoning_config.get("enabled") is False
+            and not (
+                is_kimi or is_tokenhub or is_openrouter or is_nous
+                or is_github_models or params.get("is_lmstudio", False)
+                or provider_name == "gemini"
+            )
+        ):
+            extra_body["enable_thinking"] = False
+
         # Merge any pre-built extra_body additions
         additions = params.get("extra_body_additions")
         if additions:
