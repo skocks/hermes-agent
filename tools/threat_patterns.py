@@ -268,11 +268,19 @@ def first_threat_message(content: str, scope: str = "strict") -> Optional[str]:
     pid = findings[0]
     if pid.startswith("invisible_unicode_"):
         codepoint = pid.replace("invisible_unicode_", "")
-        return f"Blocked: content contains invisible unicode character {codepoint} (possible injection)."
+        return (
+            f"Blocked: content contains invisible unicode character {codepoint} "
+            f"(possible injection). This is a deterministic block — remove the "
+            f"offending character; do not retry the same content."
+        )
     return (
-        f"Blocked: content matches threat pattern '{pid}'. "
-        f"Content is injected into the system prompt and must not contain "
-        f"injection or exfiltration payloads."
+        f"Blocked: content matches threat pattern '{pid}'. Content is injected "
+        f"into the system prompt and must not contain injection or exfiltration "
+        f"payloads. This is a deterministic block, not a formatting error — "
+        f"rewording the same fact will keep failing. Drop the specific flagged "
+        f"reference entirely (e.g. literal secret/config paths such as "
+        f"~/.hermes/.env) and store only the non-sensitive fact, or skip the "
+        f"write. Do not retry a reworded variant of the same reference."
     )
 
 
