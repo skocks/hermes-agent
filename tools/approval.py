@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2557,6 +2558,89 @@ def _strip_line_comment(line: str) -> str:
     return line
 
 
+# ── Smart-approval fast-path + verdict cache ──────────────────────────────────
+# Two cost reducers for the LLM approval sidecar (the security-reviewer aux call
+# is a serial, agent-blocking round-trip on the same slow local model):
+#   1. Fast-path: obviously-safe, single, read-only commands on non-confidential
+#      paths are approved WITHOUT the LLM at all.
+#   2. Cache: identical commands reuse a prior approve/deny verdict instead of
+#      re-invoking the reviewer.
+
+# Pure readers only. Deliberately EXCLUDES anything that can execute or write
+# arbitrary things — python/python3 -c, sed (sed -i), awk (system()), find
+# (-exec/-delete), xargs, tee, dd, cp/mv/rm — those still go to the LLM.
+_SAFE_READONLY_CMDS = frozenset({
+    "cat", "head", "tail", "nl", "less", "more", "ls", "tree", "stat", "file",
+    "wc", "sort", "uniq", "cut", "column", "rg", "grep", "egrep", "fgrep",
+    "jq", "yq", "basename", "dirname", "realpath", "readlink", "du", "df",
+    "pwd", "echo", "printf",
+})
+
+# Any shell metacharacter that could enable a write, chain, substitution,
+# subshell, or network egress disqualifies the fast-path (falls to the LLM).
+_UNSAFE_SHELL_META = re.compile(r'[>|<;&$`(){}]')
+
+# Reading a confidential target is NOT fast-pathed — union of the sensitive
+# path fragments already defined above (secrets, ssh, hermes env/config, shell
+# rc, project .env, system config).
+_READ_SENSITIVE_TARGET = re.compile(
+    rf'(?:{_SSH_SENSITIVE_PATH}|{_HERMES_ENV_PATH}|{_HERMES_CONFIG_PATH}|'
+    rf'{_SHELL_RC_FILES}|{_CREDENTIAL_FILES}|{_PROJECT_ENV_PATH}|'
+    rf'{_SYSTEM_CONFIG_PATH})',
+    re.IGNORECASE,
+)
+
+
+def _is_safe_readonly_command(command: str) -> bool:
+    """True for a single, simple, read-only command on a non-confidential path.
+
+    Conservative by design: anything with shell metacharacters (redirection,
+    pipes, chaining, command/parameter substitution, subshells), a confidential
+    target, a multi-line body, or a command not in the pure-reader allowlist
+    falls through to the LLM reviewer. The command text is untrusted, so this
+    must never approve anything that could execute or write.
+    """
+    cmd = command.strip()
+    if not cmd or "\n" in cmd:
+        return False
+    if _UNSAFE_SHELL_META.search(cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] not in _SAFE_READONLY_CMDS:
+        return False
+    if _READ_SENSITIVE_TARGET.search(cmd):
+        return False
+    return True
+
+
+_SMART_APPROVE_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_SMART_APPROVE_CACHE_MAX = 512
+_SMART_APPROVE_CACHE_LOCK = threading.Lock()
+
+
+def _smart_approve_cache_get(key: str) -> Optional[str]:
+    with _SMART_APPROVE_CACHE_LOCK:
+        verdict = _SMART_APPROVE_CACHE.get(key)
+        if verdict is not None:
+            _SMART_APPROVE_CACHE.move_to_end(key)
+        return verdict
+
+
+def _smart_approve_cache_put(key: str, verdict: str) -> None:
+    # Only cache deterministic verdicts. 'escalate' routes to a human, so it
+    # must re-evaluate every time rather than being pinned.
+    if verdict not in ("approve", "deny"):
+        return
+    with _SMART_APPROVE_CACHE_LOCK:
+        _SMART_APPROVE_CACHE[key] = verdict
+        _SMART_APPROVE_CACHE.move_to_end(key)
+        while len(_SMART_APPROVE_CACHE) > _SMART_APPROVE_CACHE_MAX:
+            _SMART_APPROVE_CACHE.popitem(last=False)
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -2576,11 +2660,29 @@ def _smart_approve(command: str, description: str) -> str:
     Inspired by OpenAI Codex's Smart Approvals guardian subagent
     (openai/codex#13860).
     """
+    # Strip shell comments to remove the easiest injection vector. Done before
+    # the fast-path/cache so both see the same normalized text the LLM would.
+    sanitized_command = _strip_shell_comments(command)
+
+    # Fast-path: obviously-safe read-only command on a non-confidential path —
+    # approve without spending an LLM round-trip.
+    if _is_safe_readonly_command(sanitized_command):
+        logger.debug(
+            "Smart approvals: fast-path approve (safe read-only): %s",
+            sanitized_command[:80],
+        )
+        return "approve"
+
+    # Cache: identical prior command → reuse its approve/deny verdict.
+    cache_key = sanitized_command.strip()
+    cached = _smart_approve_cache_get(cache_key)
+    if cached is not None:
+        logger.debug("Smart approvals: cache hit (%s): %s", cached, cache_key[:80])
+        return cached
+
     try:
         from agent.auxiliary_client import call_llm
-
-        # Strip shell comments to remove the easiest injection vector.
-        sanitized_command = _strip_shell_comments(command)
+        from hermes_constants import parse_reasoning_effort
 
         system_prompt = (
             "You are a security reviewer for an AI coding agent. "
@@ -2611,6 +2713,15 @@ def _smart_approve(command: str, description: str) -> str:
             "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
         )
 
+        # A one-word verdict needs no chain-of-thought. Disabling reasoning on
+        # this aux call cuts the per-approval cost from ~350 gen tokens to a
+        # handful on reasoning-capable local models (the sidecar was the single
+        # biggest serial, agent-blocking overhead in turn analysis).
+        try:
+            _no_think = parse_reasoning_effort("none")
+        except Exception:
+            _no_think = None
+
         response = call_llm(
             task="approval",
             messages=[
@@ -2619,16 +2730,20 @@ def _smart_approve(command: str, description: str) -> str:
             ],
             temperature=0,
             max_tokens=16,
+            reasoning_config=_no_think,
         )
 
         answer = (response.choices[0].message.content or "").strip().upper()
 
         if answer == "APPROVE":
-            return "approve"
+            verdict = "approve"
         elif answer == "DENY":
-            return "deny"
+            verdict = "deny"
         else:
-            return "escalate"
+            verdict = "escalate"
+
+        _smart_approve_cache_put(cache_key, verdict)
+        return verdict
 
     except Exception as e:
         logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
