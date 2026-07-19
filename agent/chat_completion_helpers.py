@@ -978,6 +978,53 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _turn_is_tool_continuation(api_messages: list) -> bool:
+    """True when this turn processes tool output rather than a fresh user ask.
+
+    Scans from the end past assistant/system scaffolding: the most recent
+    role-bearing message is a ``tool`` result on a continuation turn (the model
+    already planned on the user turn and is now executing) or a ``user`` message
+    on a planning turn.
+    """
+    for m in reversed(api_messages or ()):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role == "tool":
+            return True
+        if role == "user":
+            return False
+        # assistant / system → keep scanning to the turn's driver
+    return False
+
+
+def _adaptive_reasoning_config(agent, api_messages: list):
+    """Per-turn reasoning override for binary-thinking local models.
+
+    Opt-in via ``agent.adaptive_reasoning: true`` in config.yaml. Some local
+    models (e.g. Qwen3.6 served by TabbyAPI) honor only a binary ``enable_thinking``
+    toggle — graduated ``reasoning_effort`` levels are no-ops — so the only real
+    lever is thinking on/off. When enabled, this disables thinking on
+    tool-continuation turns (executing tool results rarely needs a fresh
+    chain-of-thought) and keeps the configured level on planning turns (a fresh
+    user message). It never turns thinking ON that the user disabled globally.
+    Returns ``agent.reasoning_config`` unchanged when the flag is off.
+    """
+    base = getattr(agent, "reasoning_config", None)
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        if not cfg_get(load_config(), "agent", "adaptive_reasoning", default=False):
+            return base
+    except Exception:
+        return base
+    # Respect a global "thinking off" — never re-enable what the user disabled.
+    if isinstance(base, dict) and base.get("enabled") is False:
+        return base
+    if _turn_is_tool_continuation(api_messages):
+        return {"enabled": False}
+    return base
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
@@ -1176,7 +1223,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_adaptive_reasoning_config(agent, api_messages),
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
@@ -1208,7 +1255,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
-        reasoning_config=agent.reasoning_config,
+        reasoning_config=_adaptive_reasoning_config(agent, api_messages),
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
