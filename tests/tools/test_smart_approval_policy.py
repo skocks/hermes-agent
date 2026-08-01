@@ -106,8 +106,9 @@ class TestSmartApprovePolicyInjection(unittest.TestCase):
         """If the config reader itself blows up, _smart_approve fails safe."""
         mock_call_llm.return_value = _make_response("APPROVE")
         mock_cfg.side_effect = RuntimeError("config unreadable")
-        # _smart_approve's outer try/except catches this and escalates
-        assert _smart_approve("echo hi", "flagged") == "escalate"
+        # Use a command that is NOT fast-pathed (python is not in the safe-readonly list)
+        # so the test exercises the config-read path inside _smart_approve.
+        assert _smart_approve("python -c 'print(1)'", "script execution") == "escalate"
 
 
 if __name__ == "__main__":

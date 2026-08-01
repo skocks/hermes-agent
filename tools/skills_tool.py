@@ -73,6 +73,7 @@ import time
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
+import threading
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -86,6 +87,121 @@ from agent.skill_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── skill_view dedup cache ─────────────────────────────────────────────
+# Repeated skill_view calls for the same skill re-inject the full content
+# into context (observed: ascii-video SKILL.md loaded twice, ~16K chars
+# each, plus 3 reference docs ~123K chars).  Mirror the read_file dedup
+# pattern (tools/file_tools.py): track the last-viewed mtime per
+# (task_id, resolved_path) and return a lightweight stub when unchanged so
+# the model refers to the earlier result instead of re-loading it.
+_SKILL_VIEW_DEDUP_CAP = 1000
+_SKILL_VIEW_DEDUP_STATUS_MESSAGE = (
+    "This skill content is unchanged since it was last viewed. The content "
+    "from the earlier skill_view result in this conversation is still "
+    "current — refer to that instead of re-loading it."
+)
+_skill_view_dedup_lock = threading.Lock()
+_skill_view_dedup: dict = {}        # {task_id: {resolved_path: mtime}}
+_skill_view_dedup_hits: dict = {}   # {task_id: {resolved_path: stub count}}
+
+
+def reset_skill_view_dedup(task_id: str = None) -> None:
+    """Clear the skill_view dedup cache.
+
+    Called after context compression — the original skill content has been
+    summarised away, so a re-view must return the full content, not an
+    "unchanged" stub pointing at content that no longer exists in context.
+    Mirrors tools/file_tools.py::reset_file_dedup.  Call with a task_id to
+    clear just that task, or without to clear all.
+    """
+    with _skill_view_dedup_lock:
+        if task_id:
+            _skill_view_dedup.pop(task_id, None)
+            _skill_view_dedup_hits.pop(task_id, None)
+        else:
+            _skill_view_dedup.clear()
+            _skill_view_dedup_hits.clear()
+
+
+def notify_skill_view_other_tool(task_id: str = "default") -> None:
+    """Reset consecutive skill_view stub counters for a task.
+
+    Called by the tool dispatcher (model_tools.py) whenever a tool OTHER
+    than skill_view / skills_list runs — an intervening tool call breaks
+    any stub-loop, so the next skill_view is treated as fresh.  Mirrors
+    tools/file_tools.py::notify_other_tool_call.
+    """
+    with _skill_view_dedup_lock:
+        hits = _skill_view_dedup_hits.get(task_id)
+        if hits:
+            hits.clear()
+
+
+def _skill_view_dedup_check(task_id: str, resolved_path: str) -> tuple:
+    """Return (stub, hits) for a skill_view on *resolved_path*.
+
+    *stub* is True when the file was already viewed in this task and its
+    mtime is unchanged — the caller should return the stub message.
+    *hits* counts consecutive stub returns for this path so callers can
+    escalate to a hard block (mirroring read_file's 2-stub rule).
+
+    This is check-only: the mtime is recorded by
+    :func:`_skill_view_dedup_record` after the content is successfully
+    returned, so a failed view never poisons the cache with a stub that
+    points at an error (mirrors tools/file_tools.py read_file).
+    """
+    task_id = task_id or "default"
+    try:
+        current_mtime = os.path.getmtime(resolved_path)
+    except OSError:
+        return False, 0
+    with _skill_view_dedup_lock:
+        seen = _skill_view_dedup.setdefault(task_id, {})
+        hits = _skill_view_dedup_hits.setdefault(task_id, {})
+        cached_mtime = seen.get(resolved_path)
+        if cached_mtime is not None and cached_mtime == current_mtime:
+            n = hits.get(resolved_path, 0) + 1
+            hits[resolved_path] = n
+            return True, n
+        return False, 0
+
+
+def _skill_view_dedup_record(task_id: str, resolved_path: str) -> None:
+    """Record a successful (full-content) view of *resolved_path*.
+
+    Called right before skill_view returns content, so only successful
+    views enter the dedup cache.  Also resets the consecutive-stub
+    counter for this path (a real view broke any stub-loop in progress).
+    """
+    task_id = task_id or "default"
+    try:
+        current_mtime = os.path.getmtime(resolved_path)
+    except OSError:
+        return
+    with _skill_view_dedup_lock:
+        seen = _skill_view_dedup.setdefault(task_id, {})
+        hits = _skill_view_dedup_hits.setdefault(task_id, {})
+        seen[resolved_path] = current_mtime
+        hits.pop(resolved_path, None)
+        # Cap growth (evict oldest by insertion order).
+        while len(seen) > _SKILL_VIEW_DEDUP_CAP:
+            seen.pop(next(iter(seen)))
+        while len(hits) > _SKILL_VIEW_DEDUP_CAP:
+            hits.pop(next(iter(hits)))
+
+
+def _skill_view_dedup_stub(name: str, file_path: str = None) -> str:
+    """Build the lightweight 'refer to the earlier result' JSON stub."""
+    return json.dumps({
+        "success": True,
+        "name": name,
+        "file": file_path,
+        "dedup": True,
+        "content_returned": False,
+        "message": _SKILL_VIEW_DEDUP_STATUS_MESSAGE,
+    }, ensure_ascii=False)
+
 
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
@@ -1363,6 +1479,27 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
+            # ── Dedup: unchanged re-view of this reference file ─────────
+            if preprocess:
+                _stub, _hits = _skill_view_dedup_check(
+                    task_id, str(target_file.resolve())
+                )
+                if _stub:
+                    if _hits >= 2:
+                        return json.dumps({
+                            "success": False,
+                            "error": (
+                                f"BLOCKED: You have called skill_view on this "
+                                f"exact file {_hits + 1} times and it has NOT "
+                                "changed. STOP calling skill_view for this "
+                                "path — the content from your earlier "
+                                "skill_view result in this conversation is "
+                                "still current. Proceed with your task using "
+                                "the information you already have."
+                            ),
+                        }, ensure_ascii=False)
+                    return _skill_view_dedup_stub(name, file_path)
+
             # Read the file content
             try:
                 content = target_file.read_text(encoding="utf-8")
@@ -1390,6 +1527,13 @@ def skill_view(
                     exc_info=True,
                 )
 
+                if preprocess:
+                    try:
+                        _skill_view_dedup_record(
+                            task_id, str(target_file.resolve())
+                        )
+                    except Exception:
+                        pass
             return json.dumps(
                 {
                     "success": True,
@@ -1403,6 +1547,26 @@ def skill_view(
 
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
+
+        # ── Dedup: unchanged re-view of the main content returns a stub ──
+        if preprocess:
+            _stub, _hits = _skill_view_dedup_check(
+                task_id, str(skill_md.resolve())
+            )
+            if _stub:
+                if _hits >= 2:
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            f"BLOCKED: You have called skill_view on this exact "
+                            f"skill {_hits + 1} times and it has NOT changed. "
+                            "STOP calling skill_view for this skill — the "
+                            "content from your earlier skill_view result in "
+                            "this conversation is still current. Proceed with "
+                            "your task using the information you already have."
+                        ),
+                    }, ensure_ascii=False)
+                return _skill_view_dedup_stub(frontmatter.get("name", name))
 
         # Get reference, template, asset, and script files if this is a directory-based skill
         reference_files = []
@@ -1693,6 +1857,13 @@ def skill_view(
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
+
+        # ── Dedup: record only now that the full content is ready ──────
+        if preprocess:
+            try:
+                _skill_view_dedup_record(task_id, str(skill_md.resolve()))
+            except Exception:
+                pass
 
         return json.dumps(result, ensure_ascii=False)
 

@@ -654,6 +654,7 @@ def _resolve_active_context_length() -> int:
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+_SKILL_VIEW_TOOLS = {"skill_view", "skills_list"}
 
 
 # =========================================================================
@@ -1299,6 +1300,15 @@ def handle_function_call(
                 notify_other_tool_call(task_id or "default")
             except Exception:
                 pass  # file_tools may not be loaded yet
+
+        # Mirror for skill_view: an intervening non-skill tool call resets
+        # the consecutive skill_view stub counters.
+        if function_name not in _SKILL_VIEW_TOOLS:
+            try:
+                from tools.skills_tool import notify_skill_view_other_tool
+                notify_skill_view_other_tool(task_id or "default")
+            except Exception:
+                pass  # skills_tool may not be loaded yet
 
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.

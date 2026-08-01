@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from tools.approval import (
+    _SMART_APPROVE_CACHE,
     _strip_line_comment,
     _strip_shell_comments,
     _smart_approve,
@@ -90,6 +91,16 @@ class TestSmartApprovePromptHardening(unittest.TestCase):
     tests patch ``call_llm`` at its source module and inspect the ``messages``
     kwarg that the guard builds.
     """
+
+    def setUp(self):
+        """Clear the module-level smart-approval cache between tests.
+
+        ``_SMART_APPROVE_CACHE`` is a module-level ``OrderedDict`` in
+        ``tools.approval``.  Tests that mock ``call_llm`` need it fresh
+        so a prior test's cache hit doesn't short-circuit the LLM call
+        that the current test expects to inspect.
+        """
+        _SMART_APPROVE_CACHE.clear()
 
     def _make_response(self, answer: str):
         """Build a mock LLM response with the given one-word answer."""

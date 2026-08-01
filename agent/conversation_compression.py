@@ -2361,6 +2361,14 @@ def compress_context(
         except Exception:
             pass
 
+        # Same for skill_view: after compression the skill content is
+        # summarised away, so a re-view must return the full content.
+        try:
+            from tools.skills_tool import reset_skill_view_dedup
+            reset_skill_view_dedup(task_id)
+        except Exception:
+            pass
+
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
@@ -2521,6 +2529,12 @@ def _compress_context_via_codex_app_server(
         from tools.file_tools import reset_file_dedup
 
         reset_file_dedup(task_id)
+    except Exception:
+        pass
+    try:
+        from tools.skills_tool import reset_skill_view_dedup
+
+        reset_skill_view_dedup(task_id)
     except Exception:
         pass
 
