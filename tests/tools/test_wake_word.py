@@ -624,3 +624,66 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
         if process.is_alive():
             process.terminate()
         process.join(10)
+
+
+# ── sherpa BPE tokenizer (_bpe_text2token) ───────────────────────────────
+#
+# These cover the two reasons we do not call ``sherpa_onnx.text2token``:
+# its unconditional pypinyin import, and its list return that silently drops
+# out-of-vocabulary phrases. The pre-existing ``_install_fake_sherpa`` helper
+# stubbed text2token out entirely, so neither was ever exercised.
+
+
+def _bpe_fixture(monkeypatch, tmp_path, encode):
+    """Fake sentencepiece + a tokens.txt, so tokenization runs offline."""
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text(
+        "\n".join(f"{t} {i}" for i, t in enumerate(["<blk>", "_HE", "Y", "_W", "IN"])),
+        encoding="utf-8",
+    )
+    bpe = tmp_path / "bpe.model"
+    bpe.write_bytes(b"x")
+
+    class _FakeSp:
+        def load(self, path):
+            pass
+
+        def encode(self, texts, out_type=str):
+            return [encode(t) for t in texts]
+
+    spm = types.ModuleType("sentencepiece")
+    spm.SentencePieceProcessor = _FakeSp
+    monkeypatch.setitem(sys.modules, "sentencepiece", spm)
+    return str(tokens), str(bpe)
+
+
+def test_bpe_text2token_maps_each_phrase_to_its_pieces(monkeypatch, tmp_path):
+    tokens, bpe = _bpe_fixture(monkeypatch, tmp_path, lambda t: ["_HE", "Y"])
+    assert ww._bpe_text2token(["HEY"], tokens=tokens, bpe_model=bpe) == {
+        "HEY": ["_HE", "Y"]
+    }
+
+
+def test_bpe_text2token_needs_no_pypinyin(monkeypatch, tmp_path):
+    """sherpa's text2token imports pypinyin before branching on tokens_type."""
+    tokens, bpe = _bpe_fixture(monkeypatch, tmp_path, lambda t: ["_HE", "Y"])
+    monkeypatch.setitem(sys.modules, "pypinyin", None)  # import -> ImportError
+    assert ww._bpe_text2token(["HEY"], tokens=tokens, bpe_model=bpe) == {
+        "HEY": ["_HE", "Y"]
+    }
+
+
+def test_bpe_text2token_keeps_phrases_aligned_when_one_is_oov(monkeypatch, tmp_path):
+    """An OOV phrase must not shift later phrases onto the wrong tokens.
+
+    sherpa's text2token drops the offending entry from a positional list, so a
+    caller zipping it against the input list routes every later phrase to the
+    wrong profile. Keying by phrase makes that impossible.
+    """
+    encodings = {"BAD": ["_NOPE"], "GOOD": ["_W", "IN"]}
+    tokens, bpe = _bpe_fixture(monkeypatch, tmp_path, lambda t: encodings[t])
+
+    got = ww._bpe_text2token(["BAD", "GOOD"], tokens=tokens, bpe_model=bpe)
+
+    assert "BAD" not in got  # unmappable, dropped
+    assert got["GOOD"] == ["_W", "IN"]  # NOT shifted onto BAD's slot
