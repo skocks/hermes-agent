@@ -68,9 +68,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestBundledPluginsRegister:
-    """All eight bundled web plugins discover and register correctly."""
+    """All nine bundled web plugins discover and register correctly."""
 
-    def test_all_seven_plugins_present_in_registry(self) -> None:
+    def test_all_bundled_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import list_providers
 
@@ -80,6 +80,7 @@ class TestBundledPluginsRegister:
             "ddgs",
             "exa",
             "firecrawl",
+            "local",
             "parallel",
             "searxng",
             "tavily",
@@ -98,6 +99,8 @@ class TestBundledPluginsRegister:
             ("firecrawl", True, True),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
+            # local: extract-only — fetches URLs given to it, has no index.
+            ("local", False, True),
         ],
     )
     def test_capability_flags_match_spec(
@@ -116,7 +119,17 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        [
+            "brave-free",
+            "ddgs",
+            "searxng",
+            "exa",
+            "parallel",
+            "tavily",
+            "firecrawl",
+            "xai",
+            "local",
+        ],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()

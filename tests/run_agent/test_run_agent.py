@@ -3647,10 +3647,20 @@ class TestRunConversation:
             content=" step is to update the config.",
             finish_reason="stop",
         )
+        # FORK DIVERGENCE (not upstream): the reassembled continuation reads as
+        # an announced-but-unexecuted action ("the best next step is to update
+        # the config."), so the dangling-intent gate in conversation_loop.py
+        # nudges once and spends a FOURTH API call. Upstream stops at three.
+        # See the fork-only _dangling_intent_nudges guard.
+        after_nudge = _mock_response(
+            content="Config updated.",
+            finish_reason="stop",
+        )
         agent.client.chat.completions.create.side_effect = [
             tool_turn,
             misreported_stop,
             continued,
+            after_nudge,
         ]
 
         with (
@@ -3662,15 +3672,31 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
-        assert result["api_calls"] == 3
-        assert (
-            result["final_response"]
-            == "Based on the search results, the best next step is to update the config."
-        )
+        assert result["api_calls"] == 4
+        # The nudged turn supplies the answer the model had only described.
+        # Upstream asserts the reassembled continuation here instead, because
+        # upstream stops at call 3 — see the FORK DIVERGENCE note above.
+        assert result["final_response"] == "Config updated."
 
+        # Upstream's actual subject: the misreported stop was treated as
+        # truncated and continued, so call 3 carries the length-continuation
+        # prompt and the two fragments reassemble.
         third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
         assert third_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in third_call_messages[-1]["content"]
+
+        third_call_text = "".join(
+            m.get("content") or ""
+            for m in third_call_messages
+            if m.get("role") == "assistant"
+        )
+        assert "Based on the search results, the best next" in third_call_text
+
+        # Fork-only: call 4 is the dangling-intent nudge asking the model to
+        # actually issue the tool call it described.
+        fourth_call_messages = agent.client.chat.completions.create.call_args_list[3].kwargs["messages"]
+        assert fourth_call_messages[-1]["role"] == "user"
+        assert "did not emit the" in fourth_call_messages[-1]["content"]
 
 
 
