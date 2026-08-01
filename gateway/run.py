@@ -2688,6 +2688,14 @@ _INTERRUPT_REASON_SSE_DISCONNECT = "SSE client disconnected"
 _INTERRUPT_REASON_GATEWAY_SHUTDOWN = "Gateway shutting down"
 _INTERRUPT_REASON_GATEWAY_RESTART = "Gateway restarting"
 
+# Home-channel "gateway is back online" broadcast fires during startup, which
+# races the platform adapters' own (re)connect. A retryable send failure
+# (e.g. Telegram's send_path_degraded while it's still reconnecting) is retried
+# on this cadence — ~8 attempts × 2s covers Telegram's 8-attempt reconnect
+# without meaningfully delaying boot on the common fast-connect path.
+_STARTUP_NOTIFY_MAX_ATTEMPTS = 8
+_STARTUP_NOTIFY_RETRY_DELAY_S = 2.0
+
 _CONTROL_INTERRUPT_MESSAGES = frozenset(
     {
         _INTERRUPT_REASON_STOP.lower(),
@@ -10969,20 +10977,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # of a restart cycle (see _is_stale_restart_redelivery).
         if chat_restart_notification_pending:
             self._booted_from_restart = True
-        await self._send_restart_notification()
+        restart_target = await self._send_restart_notification()
 
         # Broadcast a lightweight "gateway is back" message to configured home
-        # channels only for non-chat planned restarts (terminal/SIGUSR1/service
-        # paths). Chat-originated /restart already has a precise reply target
-        # in .restart_notify.json, so keep that lifecycle in the originating
-        # chat/topic instead of also leaking it to the configured home channel.
-        if planned_restart_notification_pending:
-            try:
-                await self._send_home_channel_startup_notifications(
-                    skip_targets=None,
+        # channels on ANY boot — symmetric with the shutdown broadcast in
+        # _notify_active_sessions_of_shutdown(). Previously this fired only for
+        # non-chat planned restarts (.restart_pending.json marker), so a plain
+        # stop→start, service restart, or crash-recovery came back silently
+        # while the shutdown ping had already gone out. We gate on the same
+        # drain-suppression check the shutdown broadcast uses so cloud
+        # auto-update fleets don't spam home channels, and skip the chat that
+        # already received the precise chat-originated /restart reply (from
+        # .restart_notify.json) to avoid a double "gateway is back" message.
+        try:
+            from gateway.drain_control import drain_notification_suppressed
+            startup_broadcast_suppressed = drain_notification_suppressed()
+        except Exception as e:
+            # Fail toward the louder, more-visible behaviour (mirror the
+            # shutdown-broadcast suppression check).
+            logger.debug("drain_notification_suppressed check failed: %s", e)
+            startup_broadcast_suppressed = False
+        # Run the broadcast as a tracked background task, not inline: its
+        # retry-on-degraded loop can wait several seconds for a still-connecting
+        # adapter, and blocking here would stall pending-obligation redelivery
+        # and resume-pending scheduling below.
+        if not startup_broadcast_suppressed:
+            # Same guard _run_background_task() uses: runners built without
+            # __init__ (test doubles, partially-constructed runners) have no
+            # _background_tasks, and an AttributeError here would abort start()
+            # over a best-effort notification.
+            if getattr(self, "_background_tasks", None) is None:
+                self._background_tasks = set()
+            _startup_notify_task = asyncio.create_task(
+                self._send_home_channel_startup_notifications(
+                    skip_targets={restart_target} if restart_target else None,
                 )
-            finally:
-                _clear_planned_restart_notification()
+            )
+            self._background_tasks.add(_startup_notify_task)
+            _startup_notify_task.add_done_callback(self._background_tasks.discard)
+        if planned_restart_notification_pending:
+            _clear_planned_restart_notification()
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -20301,15 +20335,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if home.scope_id:
                         metadata["scope_id"] = home.scope_id
                 send_metadata = _non_conversational_metadata(metadata, platform=platform)
-                if send_metadata is not None or transport.is_relay:
-                    result = await transport.send(
-                        platform,
-                        str(home.chat_id),
-                        message,
-                        metadata=send_metadata,
-                    )
-                else:
-                    result = await transport.adapter.send(str(home.chat_id), message)
+
+                async def _do_send(
+                    _transport=transport,
+                    _platform=platform,
+                    _chat_id=str(home.chat_id),
+                    _metadata=send_metadata,
+                ):
+                    if _metadata is not None or _transport.is_relay:
+                        return await _transport.send(
+                            _platform,
+                            _chat_id,
+                            message,
+                            metadata=_metadata,
+                        )
+                    return await _transport.adapter.send(_chat_id, message)
+
+                # Startup races the adapter's own (re)connect: a freshly booted
+                # gateway can reach this broadcast while Telegram is still
+                # discovering fallback IPs / on its first getUpdates attempt, so
+                # the very first send comes back success=False with a *retryable*
+                # error (e.g. Telegram's "send_path_degraded"). Retry those on a
+                # short cadence until the send path settles rather than losing
+                # the "gateway is back" message on every restart. Non-retryable
+                # failures (bad chat, auth) break immediately — retrying can't
+                # help and would only delay startup.
+                result = None
+                for attempt in range(_STARTUP_NOTIFY_MAX_ATTEMPTS):
+                    result = await _do_send()
+                    if result is None or getattr(result, "success", True) is not False:
+                        break
+                    if not getattr(result, "retryable", False):
+                        break
+                    if attempt < _STARTUP_NOTIFY_MAX_ATTEMPTS - 1:
+                        logger.debug(
+                            "Home-channel startup notification to %s:%s degraded "
+                            "(%s); retry %d/%d",
+                            platform.value,
+                            home.chat_id,
+                            getattr(result, "error", "?"),
+                            attempt + 1,
+                            _STARTUP_NOTIFY_MAX_ATTEMPTS - 1,
+                        )
+                        await asyncio.sleep(_STARTUP_NOTIFY_RETRY_DELAY_S)
+
                 if result is not None and getattr(result, "success", True) is False:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
