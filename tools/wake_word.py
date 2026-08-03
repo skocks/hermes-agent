@@ -553,6 +553,48 @@ def _ensure_sherpa_model(root: Optional[Path] = None) -> Path:
     return target
 
 
+def _bpe_text2token(
+    texts: List[str], *, tokens: str, bpe_model: str
+) -> Dict[str, List[str]]:
+    """Map each phrase -> its BPE token pieces for sherpa's keywords file.
+
+    Replaces ``sherpa_onnx.text2token`` for our BPE-only path, for two reasons:
+
+    * That helper imports ``pypinyin`` unconditionally, at the top of the
+      function and BEFORE it branches on ``tokens_type`` — so the pure-English
+      BPE path raises ImportError over a Chinese pinyin package it never calls.
+      sherpa-onnx does not declare it either, so it can't just be pinned away.
+    * It DROPS any phrase containing an out-of-vocabulary piece from its result
+      list, which the caller then ``zip()``s against the input list — silently
+      shifting every later phrase onto another phrase's tokens, and thus onto
+      another profile. Keying the result by phrase makes that impossible.
+    """
+    import sentencepiece as spm
+
+    vocab: set = set()
+    with open(tokens, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2:
+                vocab.add(parts[0])
+
+    sp = spm.SentencePieceProcessor()
+    sp.load(bpe_model)
+
+    out: Dict[str, List[str]] = {}
+    for text, pieces in zip(texts, sp.encode(texts, out_type=str)):
+        missing = [p for p in pieces if p not in vocab]
+        if missing:
+            logger.warning(
+                "wake word: phrase %r tokenizes to %s missing from %s — "
+                "skipping this phrase (it can never fire)",
+                text, missing, tokens,
+            )
+            continue
+        out[text] = pieces
+    return out
+
+
 class _SherpaKwsEngine(_Engine):
     """sherpa-onnx open-vocabulary keyword spotting — any typed phrase, zero training.
 
@@ -571,7 +613,6 @@ class _SherpaKwsEngine(_Engine):
         lazy_deps.ensure("wake.sherpa", prompt=False)
 
         import sherpa_onnx
-        from sherpa_onnx import text2token
 
         sub = cfg.get("sherpa") if isinstance(cfg.get("sherpa"), dict) else {}
         model_dir = str(sub.get("model_dir") or "").strip()
@@ -590,14 +631,17 @@ class _SherpaKwsEngine(_Engine):
             for prof, p in enrolled_profile_phrases().items():
                 phrase_map.setdefault(p.strip(), prof)
 
-        phrases = list(phrase_map)
         # Runtime tokenization of the arbitrary phrases — the open-vocab core.
-        tokens = text2token(
-            [p.upper() for p in phrases],
+        toks_by_phrase = _bpe_text2token(
+            [p.upper() for p in phrase_map],
             tokens=str(d / "tokens.txt"),
-            tokens_type="bpe",
             bpe_model=str(d / "bpe.model"),
         )
+        if not toks_by_phrase:
+            raise RuntimeError(
+                "sherpa wake word: no configured phrase could be tokenized "
+                f"against {d / 'tokens.txt'} — nothing to listen for"
+            )
         import tempfile
 
         # sherpa keyword entries reject spaces in the @display-name; underscore
@@ -606,9 +650,12 @@ class _SherpaKwsEngine(_Engine):
         kw = tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", prefix="hermes-kws-", delete=False, encoding="utf-8"
         )
-        for p, toks in zip(phrases, tokens):
+        for p, profile in phrase_map.items():
+            toks = toks_by_phrase.get(p.upper())
+            if toks is None:
+                continue  # untokenizable; already warned in _bpe_text2token
             display = p.upper().replace(" ", "_")
-            self._display_to_profile[display] = phrase_map[p]
+            self._display_to_profile[display] = profile
             kw.write(" ".join(toks) + f" @{display}\n")
         kw.close()
         self._keywords_file = kw.name
