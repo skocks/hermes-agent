@@ -228,6 +228,7 @@ class TestChatCompletionsBuildKwargs:
             model="qwen3", messages=msgs,
             provider_profile=profile,
             reasoning_config={"effort": "none"},
+            base_url="http://localhost:11434/v1",
         )
         assert kw["extra_body"]["think"] is False
 

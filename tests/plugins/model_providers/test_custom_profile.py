@@ -7,12 +7,17 @@ nothing when reasoning was *enabled*, so a configured ``reasoning_effort``
 was silently dropped for every custom endpoint.
 
 These tests pin the wire-shape contract:
-  - disabled            → extra_body.think = False
+  - disabled, Ollama endpoint     → extra_body.think = False +
+                                    top-level reasoning_effort="none"
+  - disabled, non-Ollama endpoint → extra_body.reasoning={"enabled": False}
+                                    (some chat templates, e.g. Qwen3.8, 400
+                                    on the literal "none" Ollama needs — #68210)
   - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect), passed through verbatim
                           including ``max``/``xhigh``
   - enabled + no effort → nothing emitted (endpoint's server default applies)
-  - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
+  - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning;
+                          also itself an Ollama-endpoint signal
 """
 
 from __future__ import annotations
@@ -48,8 +53,9 @@ class TestCustomReasoningWireShape:
         assert eb == {}
         assert tl == {}
 
-    def test_disabled_sends_think_false(self, custom_profile):
-        """enabled=False → reasoning_effort='none' top-level + think=False.
+    def test_disabled_on_ollama_sends_think_false(self, custom_profile):
+        """enabled=False on an Ollama endpoint → reasoning_effort='none'
+        top-level + think=False.
 
         Both fields are required: Ollama's /v1/chat/completions silently
         ignores extra_body.think (only /api/chat honours it — ollama#14820)
@@ -57,18 +63,48 @@ class TestCustomReasoningWireShape:
         for proxies and the native /api/chat path.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": False}, model="glm-5.2"
+            reasoning_config={"enabled": False},
+            model="glm-5.2",
+            base_url="http://localhost:11434/v1",
         )
         assert eb == {"think": False}
         assert tl == {"reasoning_effort": "none"}
 
-    def test_effort_none_sends_think_false(self, custom_profile):
+    def test_effort_none_on_ollama_sends_think_false(self, custom_profile):
         """effort='none' is the disable alias → same dual emission."""
         eb, tl = custom_profile.build_api_kwargs_extras(
-            reasoning_config={"enabled": True, "effort": "none"}, model="glm-5.2"
+            reasoning_config={"enabled": True, "effort": "none"},
+            model="glm-5.2",
+            base_url="http://localhost:11434/v1",
         )
         assert eb == {"think": False}
         assert tl == {"reasoning_effort": "none"}
+
+    def test_disabled_on_non_ollama_sends_reasoning_object(self, custom_profile):
+        """enabled=False on a non-Ollama custom endpoint (vLLM/TabbyAPI/…)
+        → generic extra_body.reasoning={"enabled": False}, NOT the Ollama
+        top-level "none" sentinel.
+
+        Some chat templates validate reasoning_effort against a fixed
+        allow-list with no "off" value (e.g. Qwen3.8: xhigh/medium/low
+        only) and 400 on a literal "none" — #68210.
+        """
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            model="qwen3.8",
+            base_url="http://localhost:5000/v1",
+        )
+        assert eb == {"reasoning": {"enabled": False}}
+        assert tl == {}
+
+    def test_disabled_with_no_base_url_defaults_to_non_ollama(self, custom_profile):
+        """No base_url/ollama_num_ctx signal → assume non-Ollama, the safer
+        default (Ollama detection is opt-in evidence, not opt-out)."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False}, model="glm-5.2"
+        )
+        assert eb == {"reasoning": {"enabled": False}}
+        assert tl == {}
 
     @pytest.mark.parametrize(
         "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
@@ -106,4 +142,15 @@ class TestCustomReasoningWithNumCtx:
         )
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
+
+    def test_num_ctx_is_itself_an_ollama_signal(self, custom_profile):
+        """An explicitly configured ollama_num_ctx implies Ollama even
+        without a matching base_url — that knob only exists for Ollama."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False},
+            ollama_num_ctx=8192,
+            model="qwen3",
+        )
+        assert eb == {"options": {"num_ctx": 8192}, "think": False}
+        assert tl == {"reasoning_effort": "none"}
 

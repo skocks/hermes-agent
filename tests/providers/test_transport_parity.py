@@ -168,5 +168,6 @@ class TestCustomOllamaParity:
             tools=None,
             provider_profile=get_provider_profile("custom"),
             reasoning_config={"enabled": False, "effort": "none"},
+            base_url="http://localhost:11434/v1",
         )
         assert kw["extra_body"]["think"] is False
