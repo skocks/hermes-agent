@@ -197,3 +197,5 @@ native/fts5_cjk/*.so
 # Playwright MCP session dumps (page-<timestamp>.yml) — per-run browser
 # artifacts, never source. One was committed by accident and untracked here.
 .playwright-mcp/
+# Local Pi runtime state
+.atl/

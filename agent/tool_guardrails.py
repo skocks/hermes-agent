@@ -260,7 +260,8 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     if tool_name == "memory":
         data = safe_json_loads(result)
         if isinstance(data, dict):
-            if data.get("success") is False and "exceed the limit" in data.get("error", ""):
+            success = data.get("success")
+            if isinstance(success, bool) and not success and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
     lower = result[:500].lower()
@@ -325,25 +326,27 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
-            record = self._no_progress.get(signature)
-            if record is not None:
-                _result_hash, repeat_count = record
-                if repeat_count >= self.config.no_progress_block_after:
-                    decision = ToolGuardrailDecision(
-                        action="block",
-                        code="idempotent_no_progress_block",
-                        message=(
-                            f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
-                        ),
-                        tool_name=tool_name,
-                        count=repeat_count,
-                        signature=signature,
-                    )
-                    self._halt_decision = decision
-                    return decision
+        # No-progress detection is deliberately NOT gated on idempotency:
+        # a mutating tool (terminal is the primary case) that returns
+        # byte-identical output for the same args is stuck just the same.
+        record = self._no_progress.get(signature)
+        if record is not None:
+            _result_hash, repeat_count = record
+            if repeat_count >= self.config.no_progress_block_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="idempotent_no_progress_block",
+                    message=(
+                        f"Blocked {tool_name}: this call returned the same "
+                        f"result {repeat_count} times. Stop repeating it unchanged; "
+                        "use the result already provided or try a different approach."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -412,10 +415,9 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        if not self._is_idempotent(tool_name):
-            self._no_progress.pop(signature, None)
-            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
-
+        # No-progress tracking applies to every tool, mutating included:
+        # identical successful output for the same tool+args is a loop
+        # signal regardless of whether the tool is read-only.
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         repeat_count = 1
@@ -429,7 +431,7 @@ class ToolCallGuardrailController:
                 code="idempotent_no_progress_warning",
                 message=(
                     f"{tool_name} returned the same result {repeat_count} times. "
-                    "Use the result already provided or change the query instead of "
+                    "Use the result already provided or change the approach instead of "
                     "repeating it unchanged."
                 ),
                 tool_name=tool_name,
@@ -438,11 +440,6 @@ class ToolCallGuardrailController:
             )
 
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
-
-    def _is_idempotent(self, tool_name: str) -> bool:
-        if tool_name in self.config.mutating_tools:
-            return False
-        return tool_name in self.config.idempotent_tools
 
     def _check_loop_cap(
         self,

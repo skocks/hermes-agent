@@ -373,6 +373,60 @@ def test_default_run_conversation_warns_without_guardrail_halt():
 
 
 
+def test_default_run_conversation_warns_terminal_no_progress_without_guardrail_halt():
+        agent = _make_agent("terminal", max_iterations=10)
+        same_args = {"command": "ls -la"}
+        responses = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_mock_tool_call("terminal", json.dumps(same_args), f"c{i}")],
+            )
+            for i in range(1, 4)
+        ]
+        responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
+        agent.client.chat.completions.create.side_effect = responses
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps({"exit_code": 0, "output": "same"}),
+            ) as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("run the same command repeatedly")
+
+        assert mock_hfc.call_count == 3
+        assert result["turn_exit_reason"].startswith("text_response")
+        assert "guardrail" not in result
+        assert result["final_response"] == "done"
+        tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
+        assert any("idempotent_no_progress_warning" in content for content in tool_contents)
+
+
+def test_config_enabled_hard_stop_blocks_terminal_no_progress_before_execution():
+    agent = _make_agent("terminal", config=_hard_stop_config())
+    args = {"command": "ls -la"}
+    result = json.dumps({"exit_code": 0, "output": "same"})
+    # _hard_stop_config sets hard_stop_after.idempotent_no_progress to 5.
+    for _ in range(5):
+        agent._tool_guardrails.after_call("terminal", args, result, failed=False)
+    tc = _mock_tool_call("terminal", json.dumps(args), "c-np-block")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    mock_hfc.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == "c-np-block"
+    assert "idempotent_no_progress_block" in messages[0]["content"]
+
+
 def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     """Regression for #30770: when the guardrail halts the loop, the
     synthesized halt message must be pushed through ``stream_delta_callback``

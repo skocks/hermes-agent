@@ -119,16 +119,63 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_mutating_or_unknown_tools_warn_but_are_not_blocked_for_repeated_identical_success_output_by_default():
+    # No-progress detection now covers mutating and unknown tools too, but
+    # without hard_stop_enabled it only warns — it never blocks execution.
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
     )
 
-    for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+    for tool_name, args in (
+        ("write_file", {"path": "/tmp/x", "content": "x"}),
+        ("custom_tool", {"x": 1}),
+    ):
+        assert controller.before_call(tool_name, args).action == "allow"
+        first = controller.after_call(tool_name, args, "ok", failed=False)
+        assert first.action == "allow"
+
+        assert controller.before_call(tool_name, args).action == "allow"
+        second = controller.after_call(tool_name, args, "ok", failed=False)
+        assert second.action == "warn"
+        assert second.code == "idempotent_no_progress_warning"
+        assert second.count == 2
+
+        # No hard stop by default: still not blocked and no halt decision.
+        assert controller.before_call(tool_name, args).action == "allow"
+        assert controller.halt_decision is None
+
+
+def test_terminal_repeated_identical_success_output_warns_and_blocks_with_hard_stop():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+hard_stop_enabled=True,
+no_progress_warn_after=2,
+no_progress_block_after=3,
+        )
+    )
+    args = {"command": "ls -la"}
+    result = json.dumps({"exit_code": 0, "output": "same"})
+
+    assert controller.before_call("terminal", args).action == "allow"
+    assert controller.after_call("terminal", args, result, failed=False).action == "allow"
+
+    assert controller.before_call("terminal", args).action == "allow"
+    second = controller.after_call("terminal", args, result, failed=False)
+    assert second.action == "warn"
+    assert second.code == "idempotent_no_progress_warning"
+    assert second.count == 2
+
+    assert controller.before_call("terminal", args).action == "allow"
+    third = controller.after_call("terminal", args, result, failed=False)
+    assert third.action == "warn"
+    assert third.count == 3
+
+    blocked = controller.before_call("terminal", args)
+    assert blocked.action == "block"
+    assert blocked.code == "idempotent_no_progress_block"
+    assert blocked.count == 3
+    assert blocked.should_halt is True
+    assert controller.halt_decision is not None
 
 
 
