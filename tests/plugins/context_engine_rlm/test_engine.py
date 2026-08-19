@@ -676,3 +676,47 @@ def test_migration_adds_superseded_column_to_existing_db(tmp_path):
     store2 = RLMStore(db_path)
     assert store2.message_count("old") == 1
     store2.close()
+
+
+# ---------------------------------------------------------------------------
+# Round-6: two paths that reset _persisted_count = 0 without going through
+# _trigger_resync() -- _trigger_resync's own docstring claims every resync
+# trigger is centralized through it; these were the counterexamples.
+# ---------------------------------------------------------------------------
+
+def test_verify_watermark_empty_transcript_branch_tombstones(tmp_path):
+    """engine.py's check_n<=0 branch in _verify_resume_watermark: fires
+    when the live transcript is empty but the resume estimate is not.
+    Harmless on THAT call (nothing to re-append yet), but without
+    _trigger_resync() the old rows stay untombstoned and the NEXT real
+    on_turn_complete duplicates them.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": "old1"}, {"role": "user", "content": "old2"}])
+
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    engine2.on_turn_complete([], turn_id=1)  # empty transcript -- hits the flagged branch
+    engine2.on_turn_complete([{"role": "user", "content": "new1"}], turn_id=2)  # real content arrives
+
+    assert engine2._store.message_count("s1") == 1, "old1/old2 must be tombstoned, not duplicated onto new1"
+
+
+def test_message_count_lookup_failure_tombstones(tmp_path):
+    """engine.py's on_session_start exception handler when message_count()
+    itself raises: same counterexample, different trigger.
+    """
+    from unittest import mock
+
+    engine = _make_engine(tmp_path)
+    engine._store.append_messages("s2", 1, [{"role": "user", "content": "old-b"}])
+
+    with mock.patch.object(engine._store, "message_count", side_effect=RuntimeError("boom")):
+        engine.on_session_start("s2")
+    assert engine._resume_verified is True
+    assert engine._persisted_count == 0
+
+    engine.on_turn_complete([{"role": "user", "content": "new-b"}], turn_id=1)
+    assert engine._store.message_count("s2") == 1, "old-b must be tombstoned, not duplicated onto new-b"

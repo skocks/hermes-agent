@@ -638,7 +638,15 @@ class RLMContextEngine(ContextEngine):
         check_n = min(5, self._persisted_count, len(messages))
         if check_n <= 0:
             if self._persisted_count > len(messages):
-                self._persisted_count = 0  # nothing to verify against; be safe
+                # Round-5 review: this bare reset skipped supersede_session()
+                # -- harmless on THIS call (nothing to re-append when the
+                # live transcript is empty), but it leaves untombstoned old
+                # rows behind, and the NEXT on_turn_complete with real
+                # messages then re-appends the whole transcript on top of
+                # them, duplicating exactly like N2. _trigger_resync()
+                # claims every resync trigger goes through it; this was the
+                # counterexample.
+                self._trigger_resync()
             return
         try:
             archived_tail = self._store.tail_content(self._session_id, check_n)
@@ -700,7 +708,15 @@ class RLMContextEngine(ContextEngine):
                 self._resume_verified = self._persisted_count == 0  # nothing to verify against
             except Exception:
                 logger.exception("RLM: message_count lookup failed on session start")
-                self._persisted_count = 0
+                # Round-5 review: same counterexample as the check_n<=0
+                # branch above -- a bare reset here skips supersede_session(),
+                # leaving any real old rows untombstoned for the next append
+                # to duplicate on top of. We don't know if there ARE old
+                # rows (the query that would tell us just failed), so
+                # _trigger_resync() is the safe default regardless; its own
+                # supersede_session() call is independently guarded if the
+                # store is unhappy for the same underlying reason.
+                self._trigger_resync()
                 self._resume_verified = True
         else:
             self._persisted_count = 0
