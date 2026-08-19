@@ -113,10 +113,9 @@ RLM_REPL_SCHEMA = {
         "- reset() -> clears every variable you've set (keeping context/"
         "history/rlm_query/code_log/reset). Call this when starting an "
         "unrelated task so leftover variables from an earlier one (chunks, "
-        "summary, results, ...) can't silently leak into it. If a call's "
-        "output ends with a '[REPL: N name(s) from earlier call(s) still "
-        "live: ...]' line, that's this happening — decide whether those "
-        "names still matter or call reset().\n"
+        "summary, results, ...) can't silently leak into it. If a "
+        "response includes a 'stale_names' field, that's this happening — "
+        "decide whether those names still matter or call reset().\n"
         "- code_log(n=20) -> the actual Python source of your last n calls "
         "in this REPL, most recent last. Variables and functions persist "
         "across turns, but root's visible chat context does not (older "
@@ -572,14 +571,20 @@ class RLMContextEngine(ContextEngine):
             # The live transcript got shorter than what we've archived —
             # e.g. a /reset, a manual /compress, or a session we haven't
             # seen state for. Don't silently drop future messages: re-sync
-            # from zero and accept the (harmless, query-side-visible)
-            # duplicate rows over the alternative of quietly losing data.
+            # from zero. N2 fix: this used to mean a straight duplicate
+            # re-append of everything already archived (which then flowed
+            # into history()/context, so the model could see the same
+            # message several times) -- _trigger_resync() now tombstones
+            # the old rows first, so the re-append that follows below is
+            # what history()/context actually see, without losing the old
+            # rows outright (never a plain DELETE — see supersede_session's
+            # own docstring for why that isn't safe here).
             logger.info(
                 "RLM: transcript shrank under archived count (session=%s, "
                 "have=%d archived=%d) — re-syncing from 0",
                 self._session_id, len(messages), self._persisted_count,
             )
-            self._persisted_count = 0
+            self._trigger_resync()
         new_messages = messages[self._persisted_count :]
         if not new_messages:
             return
@@ -591,6 +596,25 @@ class RLMContextEngine(ContextEngine):
                 "RLM: failed to archive %d message(s) for session=%s",
                 len(new_messages), self._session_id,
             )
+
+    def _trigger_resync(self) -> None:
+        """Tombstone this session's current rows, then reset the archive
+        cursor to 0 so the caller's subsequent append_messages() re-inserts
+        the full live transcript as the new, fresh (non-superseded) view.
+        Centralized so every resync trigger (shrink-guard, watermark
+        verification failure or error) goes through the same tombstone-
+        before-reset sequence — N2 fix.
+        """
+        try:
+            self._store.supersede_session(self._session_id)
+        except Exception:
+            logger.exception(
+                "RLM: supersede_session failed for session=%s — resync will "
+                "still proceed, but old rows may remain visible alongside "
+                "the fresh re-insert until this is retried successfully",
+                self._session_id,
+            )
+        self._persisted_count = 0
 
     def _verify_resume_watermark(self, messages: List[Dict[str, Any]]) -> None:
         """M6 fix: on_session_start()'s _persisted_count estimate comes
@@ -620,7 +644,7 @@ class RLMContextEngine(ContextEngine):
             archived_tail = self._store.tail_content(self._session_id, check_n)
         except Exception:
             logger.exception("RLM: resume watermark verification failed, resyncing from 0")
-            self._persisted_count = 0
+            self._trigger_resync()
             return
         live_tail = [
             _store_stringify(m) for m in messages[self._persisted_count - check_n : self._persisted_count]
@@ -632,7 +656,7 @@ class RLMContextEngine(ContextEngine):
                 "— resyncing from 0 instead of trusting it",
                 self._session_id, self._persisted_count,
             )
-            self._persisted_count = 0
+            self._trigger_resync()
 
     def on_turn_complete(
         self,

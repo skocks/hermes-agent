@@ -62,7 +62,8 @@ def _archive_count():
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.execute(
-            "SELECT COUNT(*) FROM rlm_messages WHERE session_id = ?", (SESSION_ID,)
+            "SELECT COUNT(*) FROM rlm_messages WHERE session_id = ? AND superseded = 0",
+            (SESSION_ID,),
         )
         return cur.fetchone()[0]
     finally:
@@ -76,7 +77,7 @@ def history(where="1=1", limit=100, order_by="id DESC"):
     try:
         cur = conn.execute(
             "SELECT turn_id, role, content, ts FROM rlm_messages "
-            "WHERE session_id = ? AND (" + where + ") "
+            "WHERE session_id = ? AND superseded = 0 AND (" + where + ") "
             "ORDER BY " + order_by + " LIMIT ?",
             (SESSION_ID, int(limit)),
         )
@@ -260,16 +261,16 @@ for line in sys.stdin:
         if _var_seen_at[k] < _call_index:
             stale_names.append(k)
 
-    stdout_text = buf.getvalue()
+    result["stdout"] = buf.getvalue()
+    # N1 fix: this was appended to stdout_text and truncated away by the
+    # parent's max_output_chars cap (which keeps the FRONT and trims the
+    # END) on any call with 8000+ chars of real output -- exactly the
+    # heavy-output exploratory calls most likely to leave stale names
+    # behind, so the warning vanished precisely when it mattered most. A
+    # separate result key is never touched by that truncation, same
+    # pattern as `final`.
     if stale_names:
-        shown = ", ".join(sorted(stale_names)[:10])
-        more = f" (+{{len(stale_names) - 10}} more)" if len(stale_names) > 10 else ""
-        stdout_text += (
-            f"\\n[REPL: {{len(stale_names)}} name(s) from earlier call(s) still "
-            f"live: {{shown}}{{more}} -- call reset() if this task is unrelated "
-            "to whatever set them, or code_log() to see what did]"
-        )
-    result["stdout"] = stdout_text
+        result["stale_names"] = sorted(stale_names)
     sys.stdout.write(json.dumps(result) + "\\n")
     sys.stdout.flush()
 '''

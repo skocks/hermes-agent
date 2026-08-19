@@ -39,11 +39,36 @@ CREATE TABLE IF NOT EXISTS rlm_messages (
     turn_id     INTEGER NOT NULL,
     role        TEXT NOT NULL,
     content     TEXT NOT NULL,
-    ts          REAL NOT NULL
+    ts          REAL NOT NULL,
+    superseded  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_rlm_session_turn ON rlm_messages(session_id, turn_id);
 CREATE INDEX IF NOT EXISTS idx_rlm_session_ts ON rlm_messages(session_id, ts);
 """
+# idx_rlm_session_superseded deliberately NOT in _SCHEMA above: on an
+# existing (pre-N2) database the table already exists, so CREATE TABLE IF
+# NOT EXISTS is a no-op and the superseded column doesn't exist yet --
+# indexing a column that isn't there yet fails immediately, before
+# _migrate_add_superseded_column() ever runs. Created after migration
+# instead, once the column is guaranteed present either way (fresh CREATE
+# TABLE or ALTER TABLE).
+
+# N2 fix: a resync (shrink-guard or M6 verification failure) used to
+# re-append the entire live transcript over rows already archived,
+# duplicating them -- and those duplicates flowed straight into
+# history()/context, so the model could see the same message several
+# times and duplicates ate into the 5000-row context cap. A plain DELETE
+# before resync isn't safe either: it would destroy archive-only history,
+# which is exactly the situation that triggers a resync in the first
+# place (see _archive_new's shrink-guard).
+#
+# Fix: tombstone instead of delete or duplicate. supersede_session() marks
+# every existing row for a session as superseded=1 right before a resync
+# re-inserts the full current transcript as fresh (superseded=0) rows.
+# Nothing is ever deleted -- old rows stay in the table, physically
+# recoverable -- but every read path below filters superseded=0, so
+# history()/context/message_count only ever see the current, non-
+# duplicated view.
 
 
 class RLMStore:
@@ -61,7 +86,28 @@ class RLMStore:
             self._conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate_add_superseded_column()
+            # Safe unconditionally at this point: the column exists either
+            # way (fresh CREATE TABLE included it, or the migration above
+            # just ALTERed it in).
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rlm_session_superseded "
+                "ON rlm_messages(session_id, superseded)"
+            )
             self._conn.commit()
+
+    def _migrate_add_superseded_column(self) -> None:
+        """N2 fix: an existing ~/.hermes/rlm.db predates the superseded
+        column (_SCHEMA's CREATE TABLE IF NOT EXISTS is a no-op against an
+        already-existing table, so the column never gets added that way).
+        Caller holds self._lock.
+        """
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(rlm_messages)")}
+        if "superseded" in cols:
+            return
+        self._conn.execute(
+            "ALTER TABLE rlm_messages ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0"
+        )
 
     def append_messages(
         self, session_id: str, turn_id: int, messages: List[Dict[str, Any]]
@@ -98,13 +144,33 @@ class RLMStore:
         with self._lock:
             cur = self._conn.execute(
                 f"SELECT turn_id, role, content, ts FROM rlm_messages "
-                f"WHERE session_id = ? AND ({clauses}) ORDER BY id DESC LIMIT ?",
+                f"WHERE session_id = ? AND superseded = 0 AND ({clauses}) "
+                f"ORDER BY id DESC LIMIT ?",
                 (session_id, *params, limit),
             )
             rows = cur.fetchall()
         return [_row_to_dict(r) for r in rows]
 
     def message_count(self, session_id: str) -> int:
+        """Count of the current, non-superseded view -- what history()/
+        context actually show. This is also on_session_start()'s resume-
+        watermark estimate (see engine.py's M6 fix), which is the whole
+        reason superseded rows must be excluded here: counting them would
+        reintroduce the inflation M6 exists to catch, just one layer up.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM rlm_messages WHERE session_id = ? AND superseded = 0",
+                (session_id,),
+            )
+            return cur.fetchone()[0] or 0
+
+    def raw_row_count(self, session_id: str) -> int:
+        """Count of ALL physical rows for a session, superseded or not.
+        Debug/test use -- confirms tombstoning preserves history rather
+        than deleting it (superseded rows are never dropped, only hidden
+        from the normal read paths above).
+        """
         with self._lock:
             cur = self._conn.execute(
                 "SELECT COUNT(*) FROM rlm_messages WHERE session_id = ?",
@@ -112,17 +178,31 @@ class RLMStore:
             )
             return cur.fetchone()[0] or 0
 
+    def supersede_session(self, session_id: str) -> None:
+        """Tombstone every current row for a session before a resync
+        re-inserts the full live transcript as fresh rows. Never deletes --
+        old rows stay physically in the table (see raw_row_count), just
+        excluded from message_count/tail_content/search_any/history()
+        going forward, so a resync stops duplicating what the model
+        actually sees without losing archive-only history in the process.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rlm_messages SET superseded = 1 WHERE session_id = ? AND superseded = 0",
+                (session_id,),
+            )
+            self._conn.commit()
+
     def tail_content(self, session_id: str, n: int) -> List[str]:
-        """Content of the last n archived rows, oldest-first -- for M6's
-        resume-watermark verification: compare against the corresponding
-        tail of the live transcript to check message_count() (a raw row
-        total, inflatable by past duplication -- see _archive_new's
-        shrink-guard) actually still lines up with reality before trusting
-        it as the resume position.
+        """Content of the last n archived rows (current view only, oldest-
+        first) -- for M6's resume-watermark verification: compare against
+        the corresponding tail of the live transcript to check
+        message_count() actually still lines up with reality before
+        trusting it as the resume position.
         """
         with self._lock:
             cur = self._conn.execute(
-                "SELECT content FROM rlm_messages WHERE session_id = ? "
+                "SELECT content FROM rlm_messages WHERE session_id = ? AND superseded = 0 "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, max(0, int(n))),
             )

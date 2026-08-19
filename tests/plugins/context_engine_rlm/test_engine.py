@@ -368,27 +368,52 @@ def test_clobbered_reset_itself_self_heals(tmp_path, _cleanup_repl):
     assert "REPL namespace reset" in r["stdout"], "reset() must self-heal even after being shadowed"
 
 
-def test_staleness_footer_lists_earlier_vars_not_current_call(tmp_path, _cleanup_repl):
+def test_staleness_reported_via_dedicated_field(tmp_path, _cleanup_repl):
+    """N1 fix: this used to be an inline stdout footer, which the parent's
+    max_output_chars truncation (keeps the front, trims the end) silently
+    ate on any call with 8000+ chars of real output -- exactly the heavy-
+    output exploratory calls most likely to leave stale names behind. Now
+    a dedicated result key, immune to that truncation.
+    """
     _, repl = _archive_and_repl(tmp_path, [{"role": "user", "content": "x"}])
     _cleanup_repl.append(repl)
 
     repl.exec("chunks = [1, 2, 3]")
     r = repl.exec("print(1)")  # does not touch chunks -- must be flagged as stale
-    assert "chunks" in r["stdout"]
-    assert "__builtins__" not in r["stdout"], "exec()'s auto-injected __builtins__ is not a user variable"
+    assert r.get("stale_names") == ["chunks"]
+    assert "chunks" not in r["stdout"], "stale-name reporting must not live in stdout at all anymore"
 
     r_same_call = repl.exec("just_set = True\nprint(1)")
-    assert "just_set" not in r_same_call["stdout"], "a variable set in THIS call must not be flagged as stale yet"
+    assert "just_set" not in (r_same_call.get("stale_names") or []), (
+        "a variable set in THIS call must not be flagged as stale yet"
+    )
 
 
-def test_staleness_footer_silent_after_reset(tmp_path, _cleanup_repl):
+def test_staleness_field_absent_after_reset(tmp_path, _cleanup_repl):
     _, repl = _archive_and_repl(tmp_path, [{"role": "user", "content": "x"}])
     _cleanup_repl.append(repl)
 
     repl.exec("chunks = [1, 2, 3]")
     repl.exec("reset()")
     r = repl.exec("print(1)")
-    assert "REPL:" not in r["stdout"]
+    assert "stale_names" not in r
+
+
+def test_staleness_field_survives_heavy_stdout_truncation(tmp_path, _cleanup_repl):
+    """N1's exact regression case: a call whose real print() output alone
+    exceeds max_output_chars must still surface the drift warning.
+    """
+    _, repl = _archive_and_repl(
+        tmp_path, [{"role": "user", "content": "x"}], max_output_chars=100,
+    )
+    _cleanup_repl.append(repl)
+
+    repl.exec("chunks = [1, 2, 3]")
+    r = repl.exec("print('X' * 9000)")
+    assert r.get("truncated") is True, "sanity check: this call must actually hit the stdout cap"
+    assert r.get("stale_names") == ["chunks"], (
+        "drift warning must survive even when stdout itself gets truncated"
+    )
 
 
 def test_code_log_recovers_provenance(tmp_path, _cleanup_repl):
@@ -517,3 +542,137 @@ def test_final_absent_when_not_called(tmp_path, _cleanup_repl):
     _cleanup_repl.append(repl)
     r = repl.exec("print('no final call')")
     assert "final" not in r
+
+
+# ---------------------------------------------------------------------------
+# N2 — resync must not duplicate content into history()/context, and must
+# not destroy archive-only history either (tombstone, not delete/duplicate).
+# ---------------------------------------------------------------------------
+
+def test_resync_does_not_duplicate_visible_content(tmp_path):
+    """The exact case flagged in round-5 review: a resync used to leave
+    duplicated content directly visible through message_count() (and, via
+    the real REPL, through history()/context) -- not just extra physical
+    rows, but rows the model would actually see and could see more than
+    once.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    # Plant an inflated archive: 2 real rows + 5 unrelated stale rows,
+    # simulating what a pre-N2 resync would have left behind.
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}])
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": f"stale-{i}"} for i in range(5)])
+    assert engine._store.raw_row_count("s1") == 7
+
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    live = [{"role": "user", "content": c} for c in "abcdefghi"]  # 9 messages
+    engine2.on_turn_complete(live, turn_id=2)
+
+    assert engine2._store.message_count("s1") == 9, (
+        "the visible count must match the live transcript exactly, no "
+        "duplicates from the old inflated rows"
+    )
+
+
+def test_resync_preserves_archive_only_history_physically(tmp_path):
+    """A plain DELETE before resync would destroy archive-only history --
+    exactly the situation that triggers a resync in the first place.
+    Tombstoning must never delete: old rows stay physically present.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}])
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": f"stale-{i}"} for i in range(5)])
+
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    live = [{"role": "user", "content": c} for c in "abcdefghi"]
+    engine2.on_turn_complete(live, turn_id=2)
+
+    assert engine2._store.raw_row_count("s1") == 16, (
+        "old rows (7) plus the fresh re-insert (9) must both still exist "
+        "physically -- nothing was deleted, only hidden from the current view"
+    )
+
+
+def test_resync_does_not_fire_on_healthy_resume(tmp_path):
+    """The common, non-inflated case must not pay a supersede+full-resync
+    just because the verification machinery now exists.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    engine.on_turn_complete([{"role": "user", "content": c} for c in "abcde"], turn_id=1)
+    assert engine._store.raw_row_count("s1") == 5
+
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    engine2.on_turn_complete([{"role": "user", "content": c} for c in "abcdef"], turn_id=2)
+
+    assert engine2._store.raw_row_count("s1") == 6, "must not tombstone+reinsert when the resume estimate was accurate"
+    assert engine2._store.message_count("s1") == 6
+
+
+def test_context_shows_no_duplicates_after_resync(tmp_path, _cleanup_repl):
+    """End-to-end through the real REPL: the model-visible `context`
+    variable must not contain the same message more than once after a
+    resync, even though the physical table does (by design).
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}])
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": f"stale-{i}"} for i in range(5)])
+
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    live = [{"role": "user", "content": c} for c in "abcdefghi"]
+    engine2.on_turn_complete(live, turn_id=2)
+
+    repl = PersistentREPL(db_path=engine2._store.db_path, session_id="s1", base_url="http://x/v1", model="m")
+    _cleanup_repl.append(repl)
+    r = repl.exec("contents = [m['content'] for m in context]\nprint(len(contents), len(set(contents)))")
+    total, unique = r["stdout"].split()
+    assert total == unique == "9"
+
+
+def test_migration_adds_superseded_column_to_existing_db(tmp_path):
+    """A ~/.hermes/rlm.db from before N2 has no superseded column at all --
+    opening it must migrate cleanly, not crash, and preserve existing data.
+    """
+    import sqlite3
+    db_path = str(tmp_path / "pre_n2.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE rlm_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            turn_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            ts REAL NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO rlm_messages (session_id, turn_id, role, content, ts) "
+        "VALUES ('old', 1, 'user', 'pre-migration', 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(db_path)  # must not raise
+    assert store.message_count("old") == 1
+    store.close()
+
+    # Idempotent: opening a second time (column already present) must also work.
+    store2 = RLMStore(db_path)
+    assert store2.message_count("old") == 1
+    store2.close()
