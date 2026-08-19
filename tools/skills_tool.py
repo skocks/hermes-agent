@@ -994,6 +994,10 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 # ── BM25 lexical search over the skill catalog ────────────────────────────
 
 _BM25_TOKEN_RE = re.compile(r"[a-z0-9]+")
+    
+# Emitted when the top BM25 match only shares a small fraction of the
+# query's distinct terms — a weak/partial hit, not a confident match.
+_SKILL_SEARCH_NEAR_MISS_HINT = "Use skill_view(name) to see full content. Note: the top match only shares some keywords with your query — these are the closest, not a confident match. If none fit, call skills_list() to browse the full catalog."
 
 
 def _bm25_tokenize(text: str) -> List[str]:
@@ -1137,13 +1141,27 @@ def skill_search(query: str, top_k: int = 5) -> str:
             }
             for s, score in top
         ]
-
+    
+        hint = "Use skill_view(name) to see full content, tags, and linked files"
+        if top:
+            # Near-miss detection: if the best match only shares a small
+            # fraction of the query's distinct terms, the hit is weak —
+            # tell the model these are the closest, not a confident match.
+            best = top[0][0]
+            best_tokens = set(
+                _bm25_tokenize(f"{best.get('name', '')} {best.get('description', '')}")
+            )
+            qset = set(query_tokens)
+            coverage = (len(qset & best_tokens) / len(qset)) if qset else 1.0
+            if coverage < 0.5:
+                hint = _SKILL_SEARCH_NEAR_MISS_HINT
+    
         return json.dumps(
             {
                 "success": True,
                 "results": results,
                 "count": len(results),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "hint": hint,
             },
             ensure_ascii=False,
         )
