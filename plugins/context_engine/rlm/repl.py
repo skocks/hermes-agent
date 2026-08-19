@@ -11,13 +11,22 @@ recursively, mid-script. State persists across calls: a variable set in
 one ``rlm_repl`` tool call is still there in the next one, in the same
 session. Root only ever sees the tool's captured stdout, hard-capped.
 
-Where this still isn't the paper's exact mechanism: hermes-agent's own
-agent loop is tool-calling at the framework level (that's how EVERY
-action in hermes works, not something a context-engine plugin can
-change), so there is necessarily one tool wrapping REPL access — the
-paper's harness intercepts raw code blocks from the completion stream
-directly, no tool-calling layer at all. This is the closest approximation
-achievable without rewriting hermes' core conversation loop.
+Transport, not mechanism, is where this differs from the paper: the
+paper's harness intercepts raw code blocks straight from the completion
+stream, no tool-calling layer at all; hermes-agent wraps REPL access in
+one tool, rlm_repl, because that's how EVERY action in hermes' agent loop
+works at the framework level, not something a context-engine plugin can
+change. The paper's actual objection to tool-calling is a rigid JSON
+schema forcing the model to decompose its problem through a
+human-designed interface — RLM_REPL_SCHEMA (engine.py) has exactly one
+free-text field, `code`, which constrains nothing. Every mechanism the
+paper argues for is present here (context as data, recursion from
+model-written code, no schema-imposed decomposition); only whether the
+Python arrives JSON-escaped in a tool argument or raw in a fence differs.
+See engine.py's module docstring for why closing even that transport gap
+was checked and declined, not left unreached: it needs core conversation-
+loop surgery (conversation_loop.py's tool_calls branch is the sole
+continue-vs-finalize point), not a plugin-reachable change.
 """
 
 from __future__ import annotations

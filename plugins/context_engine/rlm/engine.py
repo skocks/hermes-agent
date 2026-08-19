@@ -20,13 +20,35 @@ verbs this ABC exposes):
     (prompt)` is the actual recursion — a language model call made from
     inside code the root model wrote, exactly the paper's mechanism,
     not engine-side digestion pretending to be that.
-  - Where this still isn't identical to the paper: hermes-agent's agent
-    loop is tool-calling at the framework level for EVERY action, not
-    something a context-engine plugin can change — so there's necessarily
-    one tool wrapping REPL access, where the paper's harness intercepts
-    raw code blocks from the completion stream with no tool-calling layer
-    at all. This is the ceiling of fidelity achievable without rewriting
-    hermes' core conversation loop. rlm_repl's own output is still
+  - Transport, not mechanism, is where this differs from the paper: the
+    paper's harness intercepts raw code blocks straight from the
+    completion stream, no tool-calling layer at all; hermes-agent wraps
+    REPL access in one tool, rlm_repl. The paper's actual objection to
+    tool-calling is that a rigid JSON schema forces the model to
+    decompose its problem through a human-designed interface —
+    RLM_REPL_SCHEMA has exactly one free-text field, `code`, which
+    constrains nothing: the model writes arbitrary Python, context is
+    bound as data inside it, rlm_query recurses from inside code the
+    model itself wrote. Every mechanism the paper argues for is present;
+    only whether the Python arrives JSON-escaped in a tool argument or
+    raw in a fence differs, and that's not what the paper's argument
+    rests on.
+    Checked, not assumed, that closing even this transport gap isn't a
+    plugin-reachable change: conversation_loop.py's
+    `if assistant_message.tool_calls:` is the sole point deciding
+    continue-vs-finalize each turn, so intercepting a fenced code block
+    instead would need an else branch there — core loop surgery, not
+    something a context-engine plugin can add. post_llm_call fires after
+    the tool loop has already finished (turn_finalizer.py), so no plugin
+    hook gets a chance to re-enter it either. There's also no fenced-block
+    precedent already in the codebase to build on (`_strip_code_fences` in
+    plugin_llm.py/title_generator.py unwraps structured output, it
+    doesn't dispatch by fence tag), and an interception design would need
+    a reserved fence tag anyway to avoid executing the ordinary python
+    blocks models emit in normal answers — which is a tool call again,
+    just one without schema validation, id correlation, or sanitizer
+    coverage. Not implementing this was a deliberate decision on
+    substance, not an unreached ceiling. rlm_repl's own output is still
     hard-capped (repl.py) as a backstop regardless of whether the model
     remembers to digest large results itself.
   - should_compress()/compress() exist only as an ABC-mandated safety
