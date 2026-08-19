@@ -725,15 +725,20 @@ def test_message_count_lookup_failure_tombstones(tmp_path):
 # Round-7 (L2/L3/L4)
 # ---------------------------------------------------------------------------
 #
-# L2 (measured, not implemented): search_any/message_count/tail_content are
-# all session_id-scoped and hit the (session_id, ...) composite indexes, so
-# cost tracks per-session row count, not total archive size. Benchmarked
-# directly (not as a pytest case -- no assertion threshold to encode, this
-# was a go/no-go measurement): 200k rows across 500 sessions, typical
-# session (~400 rows) at ~0.03ms/call; a deliberately worst-cased single
-# session at 50k rows (half tombstoned, simulating many resyncs) still
-# under 0.25ms/call. No FTS5, no retention added -- genuinely fine at
-# realistic and even unrealistic single-user scale.
+# L2 (round 7, measured only): search_any/message_count/tail_content are
+# all session_id-scoped and hit the (session_id, ...) composite indexes.
+# The round-7 measurement used matching keywords only, which let
+# search_any's ORDER BY id DESC LIMIT ? short-circuit as soon as it found
+# enough rows -- the sub-millisecond numbers above are real, but only for
+# the hit case. Correctly flagged in round-8 review: search_any is
+# auto-recall's prefilter, called on every provider request, and a MISS
+# (the common case -- most turns don't need dropped history) has no early
+# exit, so it scanned every non-superseded row in the session. Re-measured
+# with the miss case and realistic row sizes (2-8KB, not 100-byte
+# synthetic rows): 50k rows/session, 8KB rows -> ~720ms/miss, synchronous
+# on select_context's hot path, paid once per provider round trip. See
+# round-8's FTS5 fix below and store.py's _init_fts()/search_any() for the
+# actual implementation.
 
 def test_query_spend_present_even_when_rlm_query_never_called(tmp_path, _cleanup_repl):
     """L3: root must be able to see recursion spend on every call, not
@@ -814,3 +819,91 @@ def test_handle_tool_call_reports_store_error_when_schema_present_but_store_down
     engine = RLMContextEngine(config={"rlm": {"db_path": "/root/no-permission/rlm.db"}})
     result = _json.loads(engine.handle_tool_call("rlm_repl", {"code": "print(1)"}))
     assert "RLM store unavailable" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Round-8 (L2 revisited): search_any moved onto FTS5 to fix the miss-case
+# scan flagged in review. See store.py's _init_fts()/_search_any_fts().
+# ---------------------------------------------------------------------------
+
+def test_search_any_uses_fts_and_matches_prefix(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    assert store._fts_enabled, "this sqlite3 build has FTS5; test assumes it"
+    store.append_messages("s1", 1, [{"role": "user", "content": "talking about bananas today"}])
+    store.append_messages("s1", 1, [{"role": "user", "content": "nothing relevant here"}])
+
+    hits = store.search_any("s1", ["banana"])  # prefix match against "bananas"
+    assert len(hits) == 1
+    assert "bananas" in hits[0]["content"]
+
+    assert store.search_any("s1", ["zzznotfound"]) == []
+    store.close()
+
+
+def test_search_any_fts_respects_session_and_tombstone_scoping(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("s1", 1, [{"role": "user", "content": "shared keyword apples"}])
+    store.append_messages("s2", 1, [{"role": "user", "content": "shared keyword apples"}])
+
+    assert len(store.search_any("s1", ["apples"])) == 1, "must not leak another session's rows"
+
+    store.supersede_session("s1")
+    assert store.search_any("s1", ["apples"]) == [], "tombstoned rows must not surface as matches"
+    assert store.raw_row_count("s1") == 1, "tombstoning must not delete the row"
+    store.close()
+
+
+def test_search_any_fts_backfills_from_pre_fts_database(tmp_path):
+    """A database created before this fix has rlm_messages (with the
+    superseded column) but no rlm_search table -- opening it must index
+    the existing rows, not just new ones going forward.
+    """
+    import sqlite3
+    db_path = str(tmp_path / "pre_fts.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE rlm_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL, turn_id INTEGER NOT NULL, role TEXT NOT NULL,
+            content TEXT NOT NULL, ts REAL NOT NULL, superseded INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO rlm_messages (session_id, turn_id, role, content, ts) "
+        "VALUES ('old', 1, 'user', 'a pre-existing archived apricot', 1.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(db_path)
+    hits = store.search_any("old", ["apricot"])
+    assert len(hits) == 1, "backfilled row must be searchable, not just rows appended after upgrade"
+    store.close()
+
+    # Idempotent: reopening must not double-index (would surface as
+    # duplicate/garbled results or a UNIQUE-ish blowup on rowid reuse).
+    store2 = RLMStore(db_path)
+    assert len(store2.search_any("old", ["apricot"])) == 1
+    store2.close()
+
+
+def test_search_any_falls_back_to_like_when_fts_disabled(tmp_path):
+    """If sqlite3 lacks FTS5 (or CREATE VIRTUAL TABLE fails for any other
+    reason), search_any must still work correctly -- just without the
+    speedup. _fts_enabled forced False here to exercise that path directly
+    rather than depending on the local sqlite3 build's compile flags.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store._fts_enabled = False
+    store.append_messages("s1", 1, [{"role": "user", "content": "talking about bananas today"}])
+
+    hits = store.search_any("s1", ["banana"])
+    assert len(hits) == 1
+    assert store.search_any("s1", ["zzznotfound"]) == []
+    store.close()

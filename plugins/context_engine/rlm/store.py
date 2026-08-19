@@ -15,11 +15,14 @@ on its own even with check_same_thread=False).
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 _LIKE_ESCAPE = "\\"
 
@@ -95,6 +98,57 @@ class RLMStore:
                 "ON rlm_messages(session_id, superseded)"
             )
             self._conn.commit()
+            self._fts_enabled = self._init_fts()
+
+    # L2 fix: search_any's original LIKE '%kw%' scan is fine on a match --
+    # ORDER BY id DESC LIMIT ? short-circuits as soon as it finds enough
+    # rows. But a MISS (the common case: search_any is auto-recall's
+    # prefilter, called on every provider request to decide whether a turn
+    # plausibly needs dropped history) has no early exit -- it scans every
+    # non-superseded row in the session, evaluating LIKE against each one.
+    # Measured on a single session with realistic tool-result-sized rows
+    # (8KB), synchronously on select_context()'s hot path: ~83ms/miss at
+    # 5k rows, ~720ms/miss at 50k rows -- multiplied by however many
+    # provider round trips one tool-heavy turn makes. An inverted index
+    # (FTS5) turns a miss into an index lookup instead of a table scan,
+    # independent of session size. Mirrored explicitly in Python (not SQL
+    # triggers) rather than via CREATE VIRTUAL TABLE's own content-table
+    # sync, because this class is the only writer (repl.py only reads, via
+    # its own connection -- see module docstring), so explicit mirroring
+    # at the two write sites (append_messages, supersede_session) is the
+    # whole story, no hidden trigger behavior to reason about.
+    def _init_fts(self) -> bool:
+        """Best-effort: some sqlite3 builds omit FTS5. Caller holds
+        self._lock. Falls back to the LIKE scan (_search_any_like) if this
+        returns False -- never a hard dependency.
+        """
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS rlm_search USING fts5("
+                "content, session_id UNINDEXED, superseded UNINDEXED, "
+                "turn_id UNINDEXED, role UNINDEXED, ts UNINDEXED)"
+            )
+        except sqlite3.OperationalError:
+            logger.warning(
+                "RLM: FTS5 unavailable in this sqlite3 build, "
+                "search_any falls back to a LIKE scan"
+            )
+            return False
+        # Backfill: rlm_search's rowid mirrors rlm_messages.id exactly (set
+        # explicitly on every insert below), so a plain count comparison
+        # tells us whether this is a pre-existing rlm_messages table being
+        # upgraded onto FTS5 for the first time.
+        total = self._conn.execute("SELECT COUNT(*) FROM rlm_messages").fetchone()[0]
+        indexed = self._conn.execute("SELECT COUNT(*) FROM rlm_search").fetchone()[0]
+        if indexed < total:
+            self._conn.execute(
+                "INSERT INTO rlm_search(rowid, content, session_id, superseded, "
+                "turn_id, role, ts) "
+                "SELECT id, content, session_id, superseded, turn_id, role, ts "
+                "FROM rlm_messages WHERE id NOT IN (SELECT rowid FROM rlm_search)"
+            )
+            self._conn.commit()
+        return True
 
     def _migrate_add_superseded_column(self) -> None:
         """N2 fix: an existing ~/.hermes/rlm.db predates the superseded
@@ -126,21 +180,69 @@ class RLMStore:
                 "VALUES (?, ?, ?, ?, ?)",
                 rows,
             )
+            if self._fts_enabled:
+                # Re-select the rows just inserted (scoped to session_id,
+                # newest-first, capped to this batch's size) rather than
+                # trying to reconstruct ids from cursor.lastrowid -- that
+                # field's behavior across executemany() isn't reliable
+                # enough to bet row identity on. The re-select is cheap:
+                # it's the same index this table already leans on
+                # (session_id-scoped, small LIMIT).
+                just_inserted = self._conn.execute(
+                    "SELECT id, content, session_id, superseded, turn_id, role, ts "
+                    "FROM rlm_messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                    (session_id, len(rows)),
+                ).fetchall()
+                self._conn.executemany(
+                    "INSERT INTO rlm_search(rowid, content, session_id, superseded, "
+                    "turn_id, role, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    just_inserted,
+                )
             self._conn.commit()
 
     def search_any(self, session_id: str, keywords: List[str], limit: int = 20) -> List[Dict[str, Any]]:
         """Engine-internal relevance check for auto-recall — NOT exposed to
         the model (rlm_repl's history()/context give it a much richer way
-        to search). Cheap OR-of-LIKE match against a handful of keywords,
-        used only to decide "does this turn's question plausibly need
-        dropped history" before spending a digestion sub-call on it.
+        to search). Used on every provider request (select_context's hot
+        path) to decide "does this turn's question plausibly need dropped
+        history" before spending a digestion sub-call on it -- so the miss
+        case (no plausible match) is the COMMON path, not the edge case,
+        and it needs to stay cheap regardless of session size. Routes
+        through FTS5 (an index lookup) when available, falling back to the
+        original LIKE scan (a table scan on a miss) otherwise.
         """
         keywords = [k for k in (keywords or []) if k][:8]
         if not keywords:
             return []
+        limit = max(1, min(int(limit), 100))
+        if self._fts_enabled:
+            return self._search_any_fts(session_id, keywords, limit)
+        return self._search_any_like(session_id, keywords, limit)
+
+    def _search_any_fts(self, session_id: str, keywords: List[str], limit: int) -> List[Dict[str, Any]]:
+        # Keywords are pre-sanitized by _extract_keywords() to
+        # [A-Za-z0-9_]+ before they ever reach here (engine.py) -- no FTS5
+        # query-syntax characters (quotes, spaces, boolean operators) can
+        # appear, so no escaping is needed. Trailing '*' keeps prefix-match
+        # behavior close to the old LIKE '%kw%' semantics (matches "test"
+        # inside "testing"); it does NOT match a keyword as a mid-word or
+        # suffix substring ("attest") the way LIKE did -- an accepted,
+        # narrower trade for turning a scan into an index lookup on a
+        # prefilter that's explicitly "cheap and approximate" by design.
+        match_query = " OR ".join(f"{kw}*" for kw in keywords)
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT turn_id, role, content, ts FROM rlm_search "
+                "WHERE rlm_search MATCH ? AND session_id = ? AND superseded = 0 "
+                "ORDER BY rowid DESC LIMIT ?",
+                (match_query, session_id, limit),
+            )
+            rows = cur.fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    def _search_any_like(self, session_id: str, keywords: List[str], limit: int) -> List[Dict[str, Any]]:
         clauses = " OR ".join(["content LIKE ? ESCAPE '\\'"] * len(keywords))
         params = [f"%{_escape_like(k)}%" for k in keywords]
-        limit = max(1, min(int(limit), 100))
         with self._lock:
             cur = self._conn.execute(
                 f"SELECT turn_id, role, content, ts FROM rlm_messages "
@@ -191,6 +293,11 @@ class RLMStore:
                 "UPDATE rlm_messages SET superseded = 1 WHERE session_id = ? AND superseded = 0",
                 (session_id,),
             )
+            if self._fts_enabled:
+                self._conn.execute(
+                    "UPDATE rlm_search SET superseded = 1 WHERE session_id = ? AND superseded = 0",
+                    (session_id,),
+                )
             self._conn.commit()
 
     def tail_content(self, session_id: str, n: int) -> List[str]:
