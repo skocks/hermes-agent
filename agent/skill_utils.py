@@ -455,6 +455,29 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
     return global_disabled
 
 
+def get_skills_prompt_mode() -> str:
+    """Read ``skills.prompt_mode`` from config.yaml.
+
+    ``"index"`` (default) keeps the current behaviour: the full name+description
+    skill catalog is always injected into the system prompt via
+    ``build_skills_system_prompt()``. ``"search"`` suppresses that injected
+    catalog so the model relies on the ``skill_search`` / ``skills_list`` /
+    ``skill_view`` tools instead — cheaper per-turn, at the cost of an extra
+    tool round-trip. Any other/unrecognised value falls back to ``"index"``
+    (fail safe: never silently drop skill visibility from the prompt).
+    """
+    parsed = _load_raw_config()
+    if not parsed:
+        return "index"
+
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return "index"
+
+    mode = str(skills_cfg.get("prompt_mode") or "index").strip().lower()
+    return mode if mode in ("index", "search") else "index"
+
+
 def _normalize_string_set(values) -> Set[str]:
     if values is None:
         return set()

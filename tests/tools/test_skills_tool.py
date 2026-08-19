@@ -16,6 +16,7 @@ from tools.skills_tool import (
     _find_all_skills,
     skill_matches_platform,
     skills_list,
+    skill_search,
     skill_view,
     MAX_DESCRIPTION_LENGTH,
 )
@@ -294,6 +295,96 @@ class TestSkillsList:
         assert result["count"] == 1
         assert result["categories"] == ["linked"]
         assert result["skills"][0]["name"] == "knowledge-brain"
+
+
+def _make_skill_with_description(skills_dir, name, description, category=None):
+    """Like _make_skill but with a caller-controlled description (BM25 signal)."""
+    skill_dir = (skills_dir / category / name) if category else (skills_dir / name)
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\nBody.\n"
+    )
+    return skill_dir
+
+
+class TestSkillSearch:
+    def test_ranks_relevant_skill_above_irrelevant(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill_with_description(
+                tmp_path,
+                "audit",
+                "Audit Python and npm dependencies for known CVEs and fix vulnerabilities.",
+                category="security",
+            )
+            _make_skill_with_description(
+                tmp_path,
+                "orwell-writer",
+                "Write and edit marketing copy using Orwell's six writing rules.",
+                category="writing",
+            )
+
+            raw = skill_search("audit dependencies CVE vulnerabilities")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["count"] >= 1
+        assert result["results"][0]["name"] == "audit"
+        names = [r["name"] for r in result["results"]]
+        if "orwell-writer" in names:
+            assert names.index("audit") < names.index("orwell-writer")
+
+    def test_disabled_skill_never_appears(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill_with_description(
+                tmp_path,
+                "secret-audit",
+                "Audit secret dependencies for known CVEs.",
+                category="security",
+            )
+            with patch.object(
+                skills_tool_module, "_get_disabled_skill_names", return_value={"secret-audit"}
+            ):
+                raw = skill_search("secret audit dependencies CVEs")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        names = [r["name"] for r in result["results"]]
+        assert "secret-audit" not in names
+
+    def test_zero_overlap_query_returns_fallback_message(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "skill-a", category="devops")
+            raw = skill_search("zzzznonexistentqueryxyzzzz")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["results"] == []
+        assert result["count"] == 0
+        assert "skills_list" in result["message"]
+
+    def test_empty_catalog_returns_message_not_silent_empty(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            raw = skill_search("anything")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["results"] == []
+        assert "message" in result and result["message"]
+
+    def test_top_k_limits_results(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for i in range(5):
+                _make_skill_with_description(
+                    tmp_path,
+                    f"skill-{i}",
+                    f"Deploy and manage infra number {i}.",
+                    category="devops",
+                )
+            raw = skill_search("deploy manage infra", top_k=2)
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["count"] <= 2
 
 
 # ---------------------------------------------------------------------------

@@ -945,6 +945,83 @@ class TestBuildSystemPrompt:
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
 
+    def _build_prompt_with_skill_search(self, prompt_mode_config):
+        """Shared setup: agent with skill_search available, given a
+        ``skills.prompt_mode`` config, returns the rendered system prompt."""
+        tools = _make_tool_defs(
+            "web_search", "skills_list", "skill_view", "skill_search", "skill_manage"
+        )
+        toolset_map = {
+            "web_search": "web",
+            "skills_list": "skills",
+            "skill_view": "skills",
+            "skill_search": "skills",
+            "skill_manage": "skills",
+        }
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch(
+                "run_agent.check_toolset_requirements",
+                side_effect=AssertionError("should not re-check toolset requirements"),
+            ),
+            patch("run_agent.get_toolset_for_tool", create=True, side_effect=toolset_map.get),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT"),
+            patch("run_agent.OpenAI"),
+            patch(
+                "agent.skill_utils.get_skills_prompt_mode",
+                return_value=prompt_mode_config,
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            return agent._build_system_prompt()
+
+    def test_prompt_mode_search_suppresses_injected_skill_index(self):
+        prompt = self._build_prompt_with_skill_search("search")
+        assert "SKILLS_PROMPT" not in prompt
+
+    def test_prompt_mode_index_keeps_injected_skill_index(self):
+        prompt = self._build_prompt_with_skill_search("index")
+        assert "SKILLS_PROMPT" in prompt
+
+    def test_prompt_mode_search_without_skill_search_tool_falls_back_to_index(self):
+        """Safe fallback: prompt_mode=search but skill_search isn't in the
+        agent's tool set (e.g. an older toolset) must not silently drop all
+        skill visibility from the prompt."""
+        tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
+        toolset_map = {
+            "web_search": "web",
+            "skills_list": "skills",
+            "skill_view": "skills",
+            "skill_manage": "skills",
+        }
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch(
+                "run_agent.check_toolset_requirements",
+                side_effect=AssertionError("should not re-check toolset requirements"),
+            ),
+            patch("run_agent.get_toolset_for_tool", create=True, side_effect=toolset_map.get),
+            patch("run_agent.build_skills_system_prompt", return_value="SKILLS_PROMPT"),
+            patch("run_agent.OpenAI"),
+            patch("agent.skill_utils.get_skills_prompt_mode", return_value="search"),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = agent._build_system_prompt()
+
+        assert "SKILLS_PROMPT" in prompt
+
 
 class TestToolUseEnforcementConfig:
     """Tests for the agent.tool_use_enforcement config option."""

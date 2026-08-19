@@ -5478,7 +5478,7 @@ def _run_npm_install_deterministic(
             capture_output=capture_output,
         )
 
-    def _attempt() -> subprocess.CompletedProcess:
+    def _attempt() -> "subprocess.CompletedProcess":
         lockfile = cwd / "package-lock.json"
         if lockfile.exists():
             ci_result = _run([npm, "ci", "--include=dev", *extra_args])
@@ -5488,9 +5488,40 @@ def _run_npm_install_deterministic(
             # WIP fork/branch, or `npm ci` may not be available on very old npm.
         return _run([npm, "install", "--no-save", "--include=dev", *extra_args])
 
+    def _attempt_relaxed() -> "subprocess.CompletedProcess":
+        """Same as _attempt but with the engine gate relaxed.
+
+        A host npm outside the root package.json's `engines.npm` range
+        (e.g. npm 11.10–11.12, which the range excludes) fails every command
+        with EBADENGINE.  The install is otherwise fine — the engine gate is a
+        lockfile-consistency concern, not a runtime one — so retry once with
+        the gate relaxed before falling through to the repair path.
+        """
+        lockfile = cwd / "package-lock.json"
+        if lockfile.exists():
+            ci_result = _run([npm, "ci", "--include=dev", "--engine-strict=false", *extra_args])
+            if ci_result.returncode == 0:
+                return ci_result
+        return _run([npm, "install", "--no-save", "--include=dev", "--engine-strict=false", *extra_args])
+
     result = _attempt()
     if result.returncode == 0:
         return result
+
+    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
+    if "EBADENGINE" in combined or (result.returncode != 0 and not combined.strip()):
+        # A host npm outside the root package.json's `engines.npm` range
+        # (e.g. npm 11.10–11.12, which the range excludes) fails every command
+        # with EBADENGINE.  With `--silent` the error text is swallowed, so an
+        # empty-output failure is treated the same way.  The install is
+        # otherwise fine — the engine gate is a lockfile-consistency concern,
+        # not a runtime one — so retry once with the gate relaxed before
+        # falling through to the repair path.
+        relaxed = _attempt_relaxed()
+        if relaxed.returncode == 0:
+            return relaxed
+        result = relaxed
+        combined = f"{result.stdout or ''}\n{result.stderr or ''}"
 
     # An npm outside the root package.json's `engines.npm` range fails every
     # command here identically (the `npm install` fallback included), so the
@@ -5498,7 +5529,6 @@ def _run_npm_install_deterministic(
     # returns True only when it actually upgraded a Hermes-managed npm.
     from hermes_cli.npm_engine import maybe_repair_npm_engine
 
-    combined = f"{result.stdout or ''}\n{result.stderr or ''}"
     if not maybe_repair_npm_engine(npm, combined):
         return result
     return _attempt()

@@ -296,7 +296,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
+    has_skills_tools = any(
+        name in agent.valid_tool_names
+        for name in ['skills_list', 'skill_view', 'skill_manage', 'skill_search']
+    )
     if has_skills_tools:
         avail_toolsets = {
             toolset
@@ -326,7 +329,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         skills_prompt = ""
     if skills_prompt:
-        stable_parts.append(skills_prompt)
+        # skills.prompt_mode: "search" suppresses the always-injected
+        # name+description catalog in favor of the skill_search / skills_list
+        # / skill_view tools — cheaper per-turn context, at the cost of an
+        # extra tool round-trip to discover skills. Safe fallback: only
+        # suppress when skill_search is actually available; otherwise the
+        # model would lose skill discoverability entirely.
+        from agent.skill_utils import get_skills_prompt_mode
+
+        _suppress_index = (
+            get_skills_prompt_mode() == "search"
+            and "skill_search" in agent.valid_tool_names
+        )
+        if not _suppress_index:
+            stable_parts.append(skills_prompt)
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt

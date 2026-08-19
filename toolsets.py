@@ -47,7 +47,7 @@ _HERMES_CORE_TOOLS = [
     "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
     "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
     # Skills
-    "skills_list", "skill_view", "skill_manage",
+    "skills_list", "skill_view", "skill_search", "skill_manage",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
@@ -192,7 +192,7 @@ TOOLSETS = {
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
-        "tools": ["skills_list", "skill_view", "skill_manage"],
+        "tools": ["skills_list", "skill_view", "skill_search", "skill_manage"],
         "includes": []
     },
     
@@ -378,7 +378,7 @@ TOOLSETS = {
             "terminal", "process", "read_terminal", "close_terminal",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
-            "skills_list", "skill_view", "skill_manage",
+            "skills_list", "skill_view", "skill_search", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
@@ -410,7 +410,7 @@ TOOLSETS = {
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
             "vision_analyze",
-            "skills_list", "skill_view", "skill_manage",
+            "skills_list", "skill_view", "skill_search", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
@@ -438,7 +438,7 @@ TOOLSETS = {
             "bfl_flux3_keyframes_to_video", "bfl_flux3_video_continuation",
             "bfl_flux3_get_result", "bfl_flux3_prompting_guide",
             # Skills
-            "skills_list", "skill_view", "skill_manage",
+            "skills_list", "skill_view", "skill_search", "skill_manage",
             # Browser automation
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",

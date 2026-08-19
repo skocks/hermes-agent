@@ -435,7 +435,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "browser_click": "ref", "browser_type": "text",
         "image_generate": "prompt", "text_to_speech": "text",
         "vision_analyze": "question",
-        "skill_view": "name", "skills_list": "category",
+        "skill_view": "name", "skills_list": "category", "skill_search": "query",
         "cronjob": "action",
         "execute_code": "code", "delegate_task": "goal",
         "clarify": "question", "skill_manage": "name",
@@ -587,6 +587,7 @@ _TOOL_VERBS: dict[str, str] = {
     "session_search": "Searching past sessions",
     "skill_view": "Reading skill",
     "skills_list": "Listing skills",
+    "skill_search": "Searching skills",
     "skill_manage": "Updating skill",
     "delegate_task": "Delegating",
     "cronjob": "Scheduling",
@@ -606,6 +607,7 @@ _TOOL_VERBS_NO_PREVIEW: frozenset[str] = frozenset({
 _TOOL_VERBS_FOR_CONNECTOR: frozenset[str] = frozenset({
     "web_search",
     "search_files",
+    "skill_search",
 })
 
 _friendly_tool_labels: bool = True
@@ -1450,6 +1452,8 @@ def _get_cute_tool_message(
         return _wrap(f"┊ 🧠 memory    {action}  {dur}")
     if tool_name == "skills_list":
         return _wrap(f"┊ 📚 skills    list {args.get('category', 'all')}  {dur}")
+    if tool_name == "skill_search":
+        return _wrap(f"┊ 📚 skills    search \"{_trunc(args.get('query', ''), 30)}\"  {dur}")
     if tool_name == "skill_view":
         label = args.get("name", "")
         file_path = args.get("file_path")

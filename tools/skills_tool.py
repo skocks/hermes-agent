@@ -68,6 +68,7 @@ Usage:
 
 import json
 import logging
+import math
 import time
 
 from hermes_constants import get_hermes_home, display_hermes_home
@@ -958,6 +959,167 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 "skills": all_skills,
                 "categories": categories,
                 "count": len(all_skills),
+                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+            },
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        return tool_error(str(e), success=False)
+
+
+# ── BM25 lexical search over the skill catalog ────────────────────────────
+
+_BM25_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _bm25_tokenize(text: str) -> List[str]:
+    """Lowercase, punctuation-stripping whitespace tokenizer."""
+    return _BM25_TOKEN_RE.findall((text or "").lower())
+
+
+def _bm25_scores(
+    corpus_tokens: List[List[str]],
+    query_tokens: List[str],
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> List[float]:
+    """Okapi BM25 relevance score for each document in ``corpus_tokens``.
+
+    Standard defaults (k1=1.5, b=0.75). No external dependency — the
+    corpus here is small (skill catalog), so a plain inline implementation
+    is cheaper than adding rank_bm25 as a dependency.
+    """
+    n_docs = len(corpus_tokens)
+    if n_docs == 0 or not query_tokens:
+        return [0.0] * n_docs
+
+    doc_lens = [len(doc) for doc in corpus_tokens]
+    avgdl = (sum(doc_lens) / n_docs) if n_docs else 0.0
+
+    df: Dict[str, int] = {}
+    for doc in corpus_tokens:
+        for term in set(doc):
+            df[term] = df.get(term, 0) + 1
+
+    idf: Dict[str, float] = {
+        term: math.log(1 + (n_docs - freq + 0.5) / (freq + 0.5))
+        for term, freq in df.items()
+    }
+
+    scores = [0.0] * n_docs
+    for i, doc in enumerate(corpus_tokens):
+        if not doc:
+            continue
+        tf: Dict[str, int] = {}
+        for term in doc:
+            tf[term] = tf.get(term, 0) + 1
+        dl = doc_lens[i]
+        score = 0.0
+        for term in query_tokens:
+            freq = tf.get(term)
+            if not freq:
+                continue
+            term_idf = idf.get(term, 0.0)
+            denom = freq + k1 * (1 - b + b * (dl / avgdl if avgdl else 1))
+            score += term_idf * (freq * (k1 + 1)) / denom
+        scores[i] = score
+    return scores
+
+
+def skill_search(query: str, top_k: int = 5) -> str:
+    """
+    BM25 lexical (keyword) search over the skill catalog.
+
+    Ranks skills by Okapi BM25 relevance of the query terms against each
+    skill's name + full (untruncated) description — not just the 60-char
+    snippet shown in the injected system-prompt skill index. Best for
+    keyword-y queries where you know roughly what words a skill's
+    description would use. This is lexical, not semantic: a query that
+    shares no words with any skill's name/description scores zero across
+    the board. Use skills_list() to browse the full catalog when a search
+    comes up empty or you're not sure what keywords to use.
+
+    Args:
+        query: Keyword search query (e.g. "audit dependencies CVE")
+        top_k: Max number of ranked results to return (default 5)
+
+    Returns:
+        JSON string with ranked matches: name, description, category, score
+    """
+    try:
+        query = (query or "").strip()
+        if not query:
+            return tool_error("query is required", success=False)
+
+        try:
+            top_k = max(1, min(int(top_k), 50))
+        except (TypeError, ValueError):
+            top_k = 5
+
+        active_skills_dir = _skills_dir()
+        if not active_skills_dir.exists():
+            active_skills_dir.mkdir(parents=True, exist_ok=True)
+
+        # Same catalog + same visibility filters (disabled/platform/env) as
+        # skills_list — never surface a skill that skills_list would hide.
+        all_skills = _find_all_skills()
+
+        if not all_skills:
+            return json.dumps(
+                {
+                    "success": True,
+                    "results": [],
+                    "count": 0,
+                    "message": (
+                        "No skills found in skills/ directory. "
+                        "Call skills_list() for the full (empty) catalog."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        corpus_tokens = [
+            _bm25_tokenize(f"{s.get('name', '')} {s.get('description', '')}")
+            for s in all_skills
+        ]
+        query_tokens = _bm25_tokenize(query)
+        scores = _bm25_scores(corpus_tokens, query_tokens)
+
+        ranked = sorted(zip(all_skills, scores), key=lambda pair: pair[1], reverse=True)
+
+        if not query_tokens or not any(score > 0 for _, score in ranked):
+            return json.dumps(
+                {
+                    "success": True,
+                    "results": [],
+                    "count": 0,
+                    "message": (
+                        f"No skill name/description shares any keyword with '{query}'. "
+                        "This is a lexical search, not semantic — it misses skills that "
+                        "are relevant but phrased differently. "
+                        "Call skills_list() to browse the full catalog instead."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        top = [(s, score) for s, score in ranked[:top_k] if score > 0]
+        results = [
+            {
+                "name": s.get("name"),
+                "description": s.get("description"),
+                "category": s.get("category"),
+                "score": round(score, 4),
+            }
+            for s, score in top
+        ]
+
+        return json.dumps(
+            {
+                "success": True,
+                "results": results,
+                "count": len(results),
                 "hint": "Use skill_view(name) to see full content, tags, and linked files",
             },
             ensure_ascii=False,
@@ -1954,6 +2116,31 @@ SKILL_VIEW_SCHEMA = {
     },
 }
 
+SKILL_SEARCH_SCHEMA = {
+    "name": "skill_search",
+    "description": (
+        "BM25 lexical/keyword search over the skill catalog (name + full "
+        "description). Best for keyword-y queries — ranks skills by how "
+        "many query terms their name/description share. Not semantic: a "
+        "query sharing no words with any skill scores zero. If a search "
+        "comes up empty, call skills_list() to browse the full catalog."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Keyword search query (e.g. 'audit dependencies CVE')",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Max number of ranked results to return (default 5)",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 registry.register(
     name="skills_list",
     toolset="skills",
@@ -1963,6 +2150,17 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
+)
+
+registry.register(
+    name="skill_search",
+    toolset="skills",
+    schema=SKILL_SEARCH_SCHEMA,
+    handler=lambda args, **kw: skill_search(
+        query=args.get("query", ""), top_k=args.get("top_k", 5)
+    ),
+    check_fn=check_skills_requirements,
+    emoji="🔎",
 )
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a

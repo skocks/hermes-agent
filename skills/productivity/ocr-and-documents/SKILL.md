@@ -21,9 +21,15 @@ This skill covers **text extraction from PDFs and scanned documents**.
 ## Step 1: Extract Locally (default)
 
 **Local extraction is the default, including for documents that have a URL.**
-This box runs its own OCR stack (surya-2 on the `surya-ocr` systemd service),
-so documents do not need to leave the machine. Download the file and go to
-Step 2.
+This box runs its own OCR stack, so documents do not need to leave the
+machine. The `surya-ocr` systemd service was stopped and disabled
+2026-08-17 (not in active use — see exl3-serve/config.yml) and exl3-serve
+reclaimed the VRAM margin it used, so the primary OCR path is now
+exl3-serve's resident vision model (`extract_qwen_vision.py`) — see Step 2.
+Marker-pdf/surya-2 remains as a fallback for when exl3-serve isn't up, but
+spawning its own `llama-server` on-demand (rather than attaching to the
+`surya-ocr` service) is no longer guaranteed to fit alongside exl3-serve —
+that margin is gone. Download the file and go to Step 2.
 
 `web_extract` is also local on this box (`web.extract_backend: local`). It
 fetches the URL with httpx, converts HTML with BeautifulSoup, renders JS-heavy
@@ -47,17 +53,34 @@ Note: `web_extract` still makes an outbound request to the target host — the
 For any local PDF, run the wrapper — it probes the text layer and picks the tool:
 
 ```bash
-python scripts/extract.py document.pdf        # auto: pymupdf fast path OR marker OCR escalation
-python scripts/extract.py scanned.pdf         # scanned -> auto-escalates to marker-pdf OCR
-python scripts/extract.py document.pdf --force-marker   # always marker (OCR)
-python scripts/extract.py document.pdf --disable-ocr    # marker text-layer only
-python scripts/extract.py document.pdf --json           # structured output (marker path)
-python scripts/extract.py document.pdf --output_dir out/  # also save images (marker path)
+python scripts/extract.py document.pdf        # auto: pymupdf fast path OR OCR escalation
+python scripts/extract.py scanned.pdf         # scanned -> auto-escalates to OCR (exl3-serve vision, else marker-pdf)
+python scripts/extract.py document.pdf --force-vision    # always exl3-serve vision OCR
+python scripts/extract.py document.pdf --force-marker    # always marker (OCR), skips vision tier too
+python scripts/extract.py document.pdf --disable-ocr     # marker text-layer only (vision has no such mode)
+python scripts/extract.py document.pdf --json            # structured output
+python scripts/extract.py document.pdf --output_dir out/  # also save images
 ```
 
-The wrapper decides: text layer found → pymupdf4llm (instant); no text layer → marker-pdf fast mode with OCR. The model should **not** choose between extractors itself — just call `extract.py`.
+The wrapper decides: text layer found → pymupdf4llm (instant); no text layer → OCR, trying **exl3-serve vision first** (the box's resident Qwen3.8-27B VLM, `127.0.0.1:5000` — zero extra VRAM, no service to spin up), falling back to **marker-pdf** only if exl3-serve isn't reachable. The model should **not** choose between extractors itself — just call `extract.py`.
 
-### Reference: the two underlying extractors
+### exl3-serve vision OCR (primary OCR tier)
+
+Validated 2026-08-18 against a 6-page German notarial deed (dense legal text, form fields, one handwritten signature block):
+
+- **300dpi is the sweet spot.** Matches 400dpi almost exactly on dense text; 200dpi introduces real word errors (not just fuzzier rendering — e.g. misread `nächstoffener` as `nächststofferer`). `extract_qwen_vision.py` defaults to 300dpi (`--dpi` to override).
+- **Structure preservation is a prompting choice, not a capability gap.** A plain-text prompt gives flat text; the markdown-structured prompt `extract_qwen_vision.py` uses reliably turns label/value form fields into proper Markdown tables and numbered sections into headings/bold.
+- **Handwritten signatures/names are unreliable at any resolution** — different garbled guess every run. `[unclear]` markers are requested in the prompt but don't fully solve this; treat OCR'd names/signatures on legal docs as needing manual verification, not ground truth.
+- **Output isn't fully deterministic** even at `temperature: 0` — the server's `exl3_quant_floor` sampler override applies its own floor regardless of request params. Expect minor phrasing/line-wrap variation between runs on the same page, not factual drift.
+- Costs nothing extra: the vision tower (~0.9GB of the loaded 17GB weights) is resident whenever exl3-serve is up for normal agent traffic — no separate model load, no dedicated OCR service.
+
+```bash
+python scripts/extract_qwen_vision.py --check         # confirm exl3-serve is up + which model's loaded
+python scripts/extract_qwen_vision.py scanned.pdf      # OCR via exl3-serve, 300dpi, markdown output
+python scripts/extract_qwen_vision.py scanned.pdf --dpi 400   # marginal quality gain, bigger payload
+```
+
+### Reference: the underlying extractors
 
 | Feature | pymupdf (~25MB) | marker-pdf (~2.5GB) |
 |---------|-----------------|---------------------|
@@ -248,11 +271,12 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 
 - `web_extract` is always first choice for URLs
 - pymupdf is the safe default — instant, no models, works everywhere
-- marker-pdf is for OCR, scanned docs, equations, complex layouts — only when needed
+- exl3-serve vision (`extract_qwen_vision.py`) is the primary OCR tier for scanned docs — resident model, zero extra VRAM, validated 2026-08-18 (see Step 2 above for caveats: handwriting unreliable, minor non-determinism)
+- marker-pdf is the fallback OCR tier — used automatically when exl3-serve isn't reachable, or on demand for equations/forms/complex layouts marker specifically handles better
 - **Marker auto-OCR**: it extracts the text layer first and OCRs only garbled/empty blocks — a clean digital PDF gets ~no OCR; a scanned PDF gets full block OCR. `--disable_ocr` turns this off entirely.
 - **Non-feasible options on this box**: Docling on CPU (~0.04 pages/s, 25s+/page) and marker's vllm/Docker backend (needs Docker). Use pymupdf + marker llamacpp (CPU or CUDA) instead.
-- **GPU OCR needs free VRAM**: on this box exl3 serves at 128K context to free ~3GB for surya-2 (~2.5GB used, ~0.7GB slack) — don't OCR while generating with exl3 simultaneously.
-- `scripts/extract.py` is the primary entry point — it probes and escalates, so the model doesn't decide between pymupdf and marker
+- **`surya-ocr` service is disabled** (stopped 2026-08-17, not in active use — see exl3-serve/config.yml). Marker's fallback (spawning its own `llama-server`) is no longer guaranteed to fit alongside exl3-serve on the shared GPU — that's the VRAM margin `surya-ocr` used to occupy. Prefer the exl3-serve vision tier; if marker's GPU path OOMs, it should fall back to its own CPU build automatically.
+- `scripts/extract.py` is the primary entry point — it probes and escalates (pymupdf → exl3-serve vision → marker), so the model doesn't decide between extractors
 - All helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use (already cached on this box)
 - For Word docs: `pip install python-docx` (better than OCR — parses actual structure)

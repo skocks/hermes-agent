@@ -35,6 +35,7 @@ TOOL_KIND_MAP: Dict[str, ToolKind] = {
     "todo": "other",
     "skill_view": "read",
     "skills_list": "read",
+    "skill_search": "read",
     "skill_manage": "edit",
     # Web / fetch
     "web_search": "fetch",
@@ -65,7 +66,7 @@ _POLISHED_TOOLS = {
     # Files / execution
     "read_file", "write_file", "patch", "search_files", "terminal", "process", "execute_code",
     # Skills / web / browser / media
-    "skill_view", "skills_list", "skill_manage", "web_search", "web_extract",
+    "skill_view", "skills_list", "skill_search", "skill_manage", "web_search", "web_extract",
     "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_scroll",
     "browser_back", "browser_snapshot", "browser_console", "browser_get_images", "browser_vision",
     "vision_analyze", "image_generate", "text_to_speech",
@@ -160,6 +161,9 @@ def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
     if tool_name == "skills_list":
         category = str(args.get("category") or "").strip()
         return f"skills list ({category})" if category else "skills list"
+    if tool_name == "skill_search":
+        query = str(args.get("query") or "").strip()
+        return f"skill search ({query})" if query else "skill search"
     if tool_name == "skill_manage":
         action = str(args.get("action") or "manage").strip() or "manage"
         name = str(args.get("name") or "?").strip() or "?"

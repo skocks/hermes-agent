@@ -52,6 +52,7 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "session_search",
     "skill_view",
     "skills_list",
+    "skill_search",
     "vision_analyze",
     "web_extract",
     "web_search",
