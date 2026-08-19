@@ -1829,6 +1829,15 @@ DEFAULT_CONFIG = {
         # this cap also forces an early boundary advance (round-15) rather
         # than re-trimming the same oversized head every request.
         "tail_token_budget_fraction": 0.5,
+        # Round-18: prune_tool_results_only()'s floor -- a raw tool-result
+        # payload outside the protected tail (protect_last_n) must be at
+        # least this many chars before it's replaced with a placeholder
+        # pointing at rlm_repl. Already archived either way; this only
+        # controls what stays inline in the live transcript. Measured
+        # motivation: raw web-search/web-extract payloads were 50% of one
+        # real session's visible context and displaced retrieved rlm_repl
+        # results entirely within ~3.5 minutes of fetching them.
+        "prune_min_result_chars": 2000,
         # Role used for the synthetic "messages omitted" marker inserted
         # where the dropped middle used to be. The marker always lands
         # mid-conversation (after protect_first_n), never at index 0 --

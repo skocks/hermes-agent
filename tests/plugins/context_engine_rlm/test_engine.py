@@ -557,26 +557,39 @@ def test_resync_does_not_duplicate_visible_content(tmp_path):
     the real REPL, through history()/context) -- not just extra physical
     rows, but rows the model would actually see and could see more than
     once.
+
+    Round-18 rewrite: the original version of this test asserted
+    message_count() == 9 (the live transcript's own length) after resync
+    -- which was only correct BECAUSE the old fixture's "stale-N" rows
+    happened to also get blanket-tombstoned by the pre-round-18 resync,
+    silently confirming the very bug round 18 fixed (archive-only content
+    disappearing). The correct invariant is narrower: content the new
+    live transcript ACTUALLY REPRODUCES ("a", "b") must not be visible
+    twice; content it does NOT reproduce ("stale-0".."stale-4") must stay
+    visible, not vanish. Both checked explicitly here now.
     """
     engine = _make_engine(tmp_path)
     engine.on_session_start("s1")
     engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
 
-    # Plant an inflated archive: 2 real rows + 5 unrelated stale rows,
-    # simulating what a pre-N2 resync would have left behind.
+    # Plant an inflated archive: "a"/"b" (which the resync below WILL
+    # reproduce) plus 5 unrelated stale rows it will NOT.
     engine._store.append_messages("s1", 1, [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}])
     engine._store.append_messages("s1", 1, [{"role": "user", "content": f"stale-{i}"} for i in range(5)])
     assert engine._store.raw_row_count("s1") == 7
 
     engine2 = _make_engine(tmp_path)
     engine2.on_session_start("s1")
-    live = [{"role": "user", "content": c} for c in "abcdefghi"]  # 9 messages
+    live = [{"role": "user", "content": c} for c in "abcdefghi"]  # 9 messages, starts with a, b
     engine2.on_turn_complete(live, turn_id=2)
 
-    assert engine2._store.message_count("s1") == 9, (
-        "the visible count must match the live transcript exactly, no "
-        "duplicates from the old inflated rows"
+    assert engine2._store.message_count("s1") == 14, (
+        "9 from the fresh re-append + 5 preserved 'stale-N' rows the live "
+        "transcript never reproduced -- 'a'/'b' must not be double-counted, "
+        "but 'stale-N' must not have vanished either"
     )
+    contents = {row["content"] for row in engine2._store.search_any("s1", ["stale"], limit=20)}
+    assert len(contents) == 5, "the preserved stale rows must still be findable, not just counted"
 
 
 def test_resync_preserves_archive_only_history_physically(tmp_path):
@@ -623,7 +636,10 @@ def test_resync_does_not_fire_on_healthy_resume(tmp_path):
 def test_context_shows_no_duplicates_after_resync(tmp_path, _cleanup_repl):
     """End-to-end through the real REPL: the model-visible `context`
     variable must not contain the same message more than once after a
-    resync, even though the physical table does (by design).
+    resync (reproduced content deduped) -- AND must still include
+    archive-only content the resync's re-append didn't reproduce (round
+    18: this is the actual production-bug reproduction, through the real
+    REPL rather than the store API directly).
     """
     engine = _make_engine(tmp_path)
     engine.on_session_start("s1")
@@ -640,7 +656,11 @@ def test_context_shows_no_duplicates_after_resync(tmp_path, _cleanup_repl):
     _cleanup_repl.append(repl)
     r = repl.exec("contents = [m['content'] for m in context]\nprint(len(contents), len(set(contents)))")
     total, unique = r["stdout"].split()
-    assert total == unique == "9"
+    assert total == unique == "14", (
+        "9 live messages + 5 preserved stale rows, all distinct -- no "
+        "duplicates from 'a'/'b' being reproduced, and no archive-only "
+        "content missing from what the REPL can see"
+    )
 
 
 def test_migration_adds_superseded_column_to_existing_db(tmp_path):
@@ -686,12 +706,18 @@ def test_migration_adds_superseded_column_to_existing_db(tmp_path):
 # trigger is centralized through it; these were the counterexamples.
 # ---------------------------------------------------------------------------
 
-def test_verify_watermark_empty_transcript_branch_tombstones(tmp_path):
+def test_verify_watermark_empty_transcript_branch_resyncs_cleanly(tmp_path):
     """engine.py's check_n<=0 branch in _verify_resume_watermark: fires
     when the live transcript is empty but the resume estimate is not.
     Harmless on THAT call (nothing to re-append yet), but without
-    _trigger_resync() the old rows stay untombstoned and the NEXT real
-    on_turn_complete duplicates them.
+    _trigger_resync() the cursor stays inflated and the NEXT real
+    on_turn_complete would skip archiving real new content, thinking it
+    was already covered.
+
+    Round-18 rewrite: the original assertion here (message_count == 1)
+    was actually pinning the OLD bug -- old1/old2 have nothing in common
+    with new1, so a correct resync must leave them VISIBLE, not hide
+    them. Renamed off "_tombstones" accordingly.
     """
     engine = _make_engine(tmp_path)
     engine.on_session_start("s1")
@@ -703,12 +729,18 @@ def test_verify_watermark_empty_transcript_branch_tombstones(tmp_path):
     engine2.on_turn_complete([], turn_id=1)  # empty transcript -- hits the flagged branch
     engine2.on_turn_complete([{"role": "user", "content": "new1"}], turn_id=2)  # real content arrives
 
-    assert engine2._store.message_count("s1") == 1, "old1/old2 must be tombstoned, not duplicated onto new1"
+    assert engine2._store.message_count("s1") == 3, (
+        "old1/old2 must stay visible (never reproduced by new1, so never "
+        "reproduced-and-deduped) and new1 must be archived -- not old1/old2 "
+        "silently disappearing, and not new1 silently skipped"
+    )
 
 
-def test_message_count_lookup_failure_tombstones(tmp_path):
+def test_message_count_lookup_failure_resyncs_cleanly(tmp_path):
     """engine.py's on_session_start exception handler when message_count()
-    itself raises: same counterexample, different trigger.
+    itself raises: same counterexample, different trigger. See the
+    empty-transcript-branch test above for why this asserts preservation,
+    not tombstoning, post round-18.
     """
     from unittest import mock
 
@@ -721,7 +753,10 @@ def test_message_count_lookup_failure_tombstones(tmp_path):
     assert engine._persisted_count == 0
 
     engine.on_turn_complete([{"role": "user", "content": "new-b"}], turn_id=1)
-    assert engine._store.message_count("s2") == 1, "old-b must be tombstoned, not duplicated onto new-b"
+    assert engine._store.message_count("s2") == 2, (
+        "old-b must stay visible (not reproduced by new-b) and new-b must "
+        "be archived"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1746,3 +1781,183 @@ def test_dropped_marker_is_directive_not_merely_informational(tmp_path):
         "something -- that judgment call is precisely what production measured "
         "the model failing to make (97 marker-bearing turns, 0 rlm_repl calls)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-18 URGENT: supersede_session()'s blanket tombstone, used by every
+# resync, buried archive-only content instead of only deduping reproduced
+# content. Production impact: 152 tombstoned rows in one real session, 88
+# unique nowhere else, one of them a specific fact rlm_repl reported as
+# absent -- the model then fabricated a substitute in a user deliverable.
+# This is the invariant round 9 believed it had (its own docstring: a
+# plain DELETE would "drop archive-only history, which is exactly the
+# situation that triggers a resync in the first place") and did not:
+# tombstoning avoided deleting that history, then hid it just as
+# completely. Reproduced here exactly: archive content, shrink the live
+# transcript via compress() (the real mechanism that mutates it), trigger
+# a resync, assert the now-archive-only content is STILL visible -- via
+# search_any AND the real REPL's history()/context, not just row counts.
+# ---------------------------------------------------------------------------
+
+def test_resync_after_compress_preserves_dropped_only_content(tmp_path, _cleanup_repl):
+    """The exact production sequence: a long session gets compress()'d
+    (round 16 -- this really does shrink the live transcript, not just
+    the outgoing request), the next _archive_new() sees a shorter
+    transcript than what's archived and triggers a resync. Content that
+    existed ONLY in the archive before compress() -- the genuinely
+    dropped middle -- must survive that resync, findable both by the
+    engine's own search and by the model's real retrieval tool.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)  # archives everything
+    assert engine._store.message_count("s1") == len(convo)
+
+    compressed = engine.compress(convo, force=True)
+    assert len(compressed) < len(convo), "fixture must actually shrink the transcript"
+    dropped_content = {
+        m["content"] for m in convo
+        if m.get("content") not in {c.get("content") for c in compressed}
+    }
+    assert dropped_content, "fixture must actually have dropped-only content to test"
+
+    # The next real request carries the shrunk transcript -- triggers the
+    # shrink-guard -> resync path this round-18 fix touches.
+    engine.select_context(compressed, conversation_messages=compressed, budget_tokens=131072)
+
+    sample_dropped = next(iter(dropped_content))
+    keyword = sample_dropped.split()[0]  # e.g. "m17" from "m17" -- _convo's own content shape
+    hits = engine._store.search_any("s1", [keyword])
+    assert any(sample_dropped in h["content"] for h in hits), (
+        "dropped-only content must still be findable via search_any -- "
+        "not buried by the resync that just ran"
+    )
+
+    repl = PersistentREPL(db_path=engine._store.db_path, session_id="s1", base_url="http://x/v1", model="m")
+    _cleanup_repl.append(repl)
+    r = repl.exec(
+        f"matches = [m for m in context if m['content'] == {sample_dropped!r}]\n"
+        "print(len(matches))"
+    )
+    assert r["stdout"].strip() == "1", (
+        "the REPL's own context/history() -- what the model actually uses "
+        "via rlm_repl -- must also still see the dropped-only content"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-18 items 1/2: prune_tool_results_only(). RLM's tail is purely
+# positional -- traced through real turn logs, retrieved rlm_repl results
+# (60.1 KB) got fully evicted ~3.5 minutes after being fetched, displaced
+# by raw web-search payloads that grew from 5.7 KB to 115.9 KB over the
+# same window. Policy: shrink raw tool payloads by kind, before position
+# -- never rlm_repl's own results, regardless of position.
+# ---------------------------------------------------------------------------
+
+def _tool_result(call_id, content):
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+
+def _assistant_tool_call(call_id, tool_name):
+    return {
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": call_id, "function": {"name": tool_name}}],
+    }
+
+
+def test_prune_tool_results_only_shrinks_payloads_and_reports_correct_count(tmp_path):
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=2)
+    engine.on_session_start("s1")
+    huge = "x" * 5000
+
+    messages = [{"role": "system", "content": "sys"}]
+    for i in range(5):
+        messages.append({"role": "user", "content": f"search for topic {i}"})
+        messages.append(_assistant_tool_call(f"call{i}", "web_search"))
+        messages.append(_tool_result(f"call{i}", huge))
+    # Protected tail: the last 2 messages must survive untouched even
+    # though they'd otherwise qualify.
+    before_tail = messages[-2:]
+
+    pruned, count = engine.prune_tool_results_only(messages)
+    assert pruned is not messages, "must return a new list object, not mutate in place"
+    assert count == 4, "5 web_search results, 1 protected by the tail -> 4 pruned"
+
+    pruned_tool_msgs = [m for m in pruned if m.get("role") == "tool"]
+    shrunk = [m for m in pruned_tool_msgs if len(m["content"]) < len(huge)]
+    assert len(shrunk) == 4
+    for m in shrunk:
+        assert "rlm_repl" in m["content"], "placeholder must point at the recovery path"
+    assert pruned[-2:] == before_tail, "the protected tail must be untouched, not just shorter"
+
+
+def test_prune_tool_results_only_never_touches_rlm_repl_results(tmp_path):
+    """The actual point: raw tool output shrinks, rlm_repl's own results
+    never do, regardless of position -- so a raw payload can no longer
+    positionally outrank a retrieval result the model already paid for.
+    """
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1)
+    engine.on_session_start("s1")
+    huge = "y" * 5000
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "look something up in history"},
+        _assistant_tool_call("repl1", "rlm_repl"),
+        _tool_result("repl1", huge),  # rlm_repl's own result -- must survive whole
+        {"role": "user", "content": "now search the web"},
+        _assistant_tool_call("web1", "web_search"),
+        _tool_result("web1", huge),  # raw payload -- eligible to shrink
+        {"role": "user", "content": "final unrelated turn"},  # keeps web1 out of the tail
+    ]
+
+    pruned, count = engine.prune_tool_results_only(messages)
+    assert count == 1, "only the web_search result qualifies -- rlm_repl's is exempt"
+
+    repl_result = next(m for m in pruned if m.get("tool_call_id") == "repl1")
+    web_result = next(m for m in pruned if m.get("tool_call_id") == "web1")
+    assert repl_result["content"] == huge, "rlm_repl's own result must be untouched, in full"
+    assert len(web_result["content"]) < len(huge), "the raw web payload must have been shrunk"
+
+
+def test_prune_tool_results_only_loses_nothing_from_the_archive(tmp_path):
+    """Pruning must never be the operation that makes content
+    unrecoverable -- everything pruned must already be archived, in full,
+    before the placeholder replaces it in the live transcript.
+    """
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1)
+    engine.on_session_start("s1")
+    huge = "z" * 5000
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "search"},
+        _assistant_tool_call("web1", "web_search"),
+        _tool_result("web1", huge),
+        {"role": "user", "content": "final unrelated turn"},
+    ]
+    pruned, count = engine.prune_tool_results_only(messages)
+    assert count == 1
+
+    hits = engine._store.search_any("s1", ["z" * 4])
+    assert any(huge in h["content"] for h in hits), (
+        "the full, unpruned content must be findable in the archive after pruning"
+    )
+
+
+def test_prune_tool_results_only_noop_below_threshold(tmp_path):
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1, prune_min_result_chars=2000)
+    engine.on_session_start("s1")
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "search"},
+        _assistant_tool_call("web1", "web_search"),
+        _tool_result("web1", "short result"),
+        {"role": "user", "content": "final unrelated turn"},
+    ]
+    pruned, count = engine.prune_tool_results_only(messages)
+    assert count == 0
+    assert pruned is messages, "no-op contract: must hand back the SAME object when nothing qualifies"

@@ -82,7 +82,27 @@ def _archive_count():
 def history(where="1=1", limit=100, order_by="id DESC"):
     """Query this session's archived messages. where/order_by are raw SQL
     fragments over columns turn_id, role, content, ts -- scoped to this
-    session automatically, you cannot see another session's rows."""
+    session automatically, you cannot see another session's rows.
+
+    Round-18: kept the superseded=0 filter here deliberately, argued
+    explicitly rather than left as an unexamined inherited default --
+    this was reconsidered after the round-18 resync fix (engine.py's
+    supersede_reproduced_rows), not before it. Pre-fix, a resync could
+    mark genuine archive-only content superseded=1, and hiding that from
+    the model's own retrieval tool was exactly what buried a real fact
+    in production. Post-fix, superseded=1 only ever marks a row whose
+    content is BYTE-IDENTICAL to something already visible elsewhere in
+    the current view (a verified duplicate from a resync's re-append,
+    never archive-only content) -- so filtering it out here costs the
+    model nothing informational, it only prevents seeing the exact same
+    message twice under two different ids. Removing the filter would
+    reintroduce that duplicate-visible clutter (round 9's original
+    problem) for zero benefit now that nothing valuable is hidden by it.
+    Kept on message_count()/tail_content() too, for a different reason
+    (M6's resume-watermark math needs an accurate current-view count) --
+    both uses are now correct for the same underlying reason: superseded
+    rows are true duplicates only, never unique history.
+    """
     conn = sqlite3.connect(DB_PATH)
     try:
         cur = conn.execute(

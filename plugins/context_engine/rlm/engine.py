@@ -193,6 +193,12 @@ class RLMContextEngine(ContextEngine):
         self._tail_token_fraction: float = float(
             cfg.get("tail_token_budget_fraction", _DEFAULT_TAIL_TOKEN_BUDGET_FRACTION)
         )
+        # Round-18: prune_tool_results_only()'s floor -- a raw tool-result
+        # payload outside the protected tail must be at least this many
+        # chars before it's worth replacing with a placeholder. Small
+        # results aren't the problem (measured: raw web payloads were 50%
+        # of one real session's visible context, 12,548 of 24,653 tokens).
+        self._prune_min_result_chars: int = int(cfg.get("prune_min_result_chars", 2000))
         # Round-11 production break: the marker is inserted mid-conversation
         # (system + head + [marker] + tail -- see select_context()/
         # compress()), never at index 0. A role=='system' message anywhere
@@ -561,6 +567,112 @@ class RLMContextEngine(ContextEngine):
             system + head + [self._dropped_marker()] + tail
         )
 
+    # -- round-18: proactive tool-result prune ---------------------------------
+
+    def prune_tool_results_only(
+        self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None,
+    ) -> tuple:
+        """Deterministic, no-LLM transcript prune -- RLM didn't implement
+        this ABC hook before round 18, so it inherited the safe no-op.
+
+        Root cause this closes: RLM's tail is purely positional
+        (_select_tail's quantized boundary) -- newest N messages win
+        regardless of what they contain or what they cost to produce.
+        Traced through real TabbyAPI turn logs: a user session spent
+        roughly 217s of model time retrieving history via rlm_repl, and
+        that retrieved content was completely gone from the visible
+        window ~3.5 minutes later, displaced message-for-message by raw
+        web-search payloads (5.7 KB -> 115.9 KB over the same window). The
+        model then re-searched adjacent topics (59 web searches, 20
+        near-duplicate pairs at 60%+ overlap) -- lacks earlier findings,
+        retrieves them expensively, research output evicts them, lacks
+        them again. Retrieval that gets evicted before the model has used
+        it is pure waste.
+
+        POLICY, stated explicitly: this is where the value-awareness
+        lives, not select_context()/_select_tail(). Two ways to make the
+        tail value-aware were on the table -- exempt rlm_repl results
+        from _select_tail()'s positional window directly, or shrink raw
+        tool payloads by kind before they ever compete for tail space.
+        Chose the second, cheaper form: _select_tail()'s single quantized
+        boundary is round 15's whole prefix-cache-stability mechanism (a
+        measured 44x prefill reduction) -- splicing a second,
+        content-dependent inclusion rule into that hot, per-request path
+        risks reintroducing exactly the instability round 15 spent a
+        round fixing. This hook runs on its own separate, lower-frequency
+        trigger instead: every non-rlm_repl tool-result payload outside
+        the protected tail (protect_last_n, reusing select_context's own
+        notion of "recent enough to always keep"), above
+        prune_min_result_chars, gets replaced by a short placeholder
+        pointing at rlm_repl -- content already safely archived (this
+        calls _archive_new() first, same discipline as compress()), never
+        deleted, never unrecoverable. rlm_repl's OWN results are matched
+        by tool_call_id back to the assistant message that called it and
+        are NEVER pruned, at any position -- once a raw payload can no
+        longer accumulate weight, it can no longer positionally outrank a
+        retrieval result in _select_tail()'s token-budgeted tail either.
+        The pathological case (fresh retrieval evicted before use) is
+        prevented by construction: nothing this cheap for the model to
+        re-fetch (a live web page) is ever allowed to outweigh something
+        this expensive to have fetched (an rlm_repl result), because the
+        cheap thing shrinks first.
+        """
+        if not self._store:
+            return messages, 0
+        if len(messages) <= self.protect_first_n + self.protect_last_n:
+            return messages, 0
+
+        # Archive first -- pruning must never be the operation that makes
+        # content unrecoverable; it's only safe to prune BECAUSE it's
+        # already archived. Idempotent (only appends what's new), so
+        # calling this here every time this hook fires is not a growing cost.
+        self._archive_new(messages)
+
+        tool_name_by_call_id: Dict[str, str] = {}
+        for m in messages:
+            for tc in (m.get("tool_calls") or []):
+                call_id = tc.get("id")
+                fn = tc.get("function") or {}
+                name = fn.get("name")
+                if call_id and name:
+                    tool_name_by_call_id[call_id] = name
+
+        protected_tail_ids = (
+            {id(m) for m in messages[-self.protect_last_n :]} if self.protect_last_n else set()
+        )
+
+        new_messages: List[Dict[str, Any]] = []
+        pruned_count = 0
+        for m in messages:
+            if (
+                m.get("role") == "tool"
+                and id(m) not in protected_tail_ids
+                and tool_name_by_call_id.get(m.get("tool_call_id")) != "rlm_repl"
+            ):
+                text = _content_as_text(m)
+                if len(text) >= self._prune_min_result_chars:
+                    pruned = dict(m)
+                    pruned["content"] = self._prune_placeholder(len(text))
+                    new_messages.append(pruned)
+                    pruned_count += 1
+                    continue
+            new_messages.append(m)
+
+        if not pruned_count:
+            # Standard no-op caller contract (agent/context_engine.py):
+            # hand back the INPUT object so callers can gate on
+            # `result is not messages`.
+            return messages, 0
+        return new_messages, pruned_count
+
+    @staticmethod
+    def _prune_placeholder(orig_chars: int) -> str:
+        return (
+            f"[RLM: {orig_chars:,}-char tool result pruned from context to "
+            "save space -- fully archived, not lost. Call rlm_repl to "
+            "retrieve it verbatim if you need it again.]"
+        )
+
     # -- the actual mechanism --------------------------------------------------
 
     def select_context(
@@ -923,14 +1035,7 @@ class RLMContextEngine(ContextEngine):
             # The live transcript got shorter than what we've archived —
             # e.g. a /reset, a manual /compress, or a session we haven't
             # seen state for. Don't silently drop future messages: re-sync
-            # from zero. N2 fix: this used to mean a straight duplicate
-            # re-append of everything already archived (which then flowed
-            # into history()/context, so the model could see the same
-            # message several times) -- _trigger_resync() now tombstones
-            # the old rows first, so the re-append that follows below is
-            # what history()/context actually see, without losing the old
-            # rows outright (never a plain DELETE — see supersede_session's
-            # own docstring for why that isn't safe here).
+            # from zero.
             logger.info(
                 "RLM: transcript shrank under archived count (session=%s, "
                 "have=%d archived=%d) — re-syncing from 0",
@@ -940,6 +1045,47 @@ class RLMContextEngine(ContextEngine):
         new_messages = messages[self._persisted_count :]
         if not new_messages:
             return
+        # Round-18 fix: a resync used to tombstone EVERY current row
+        # up front (_trigger_resync, before this method ever saw the
+        # messages actually being re-appended), then re-append whatever
+        # the live transcript happened to contain at that moment. If the
+        # live transcript's middle was already dropped by select_context()
+        # -- the normal state once a session is long enough, not an edge
+        # case -- the re-append never reproduced everything the blanket
+        # tombstone just hid, and that archive-only content vanished from
+        # every read path (search_any, history(), context) while still
+        # physically present. Production impact: 152 tombstoned rows in
+        # one real session, 88 of them unique nowhere else, one of them a
+        # specific fact a later turn confidently reported as absent and
+        # then fabricated a substitute for.
+        #
+        # Fix: supersede only AFTER new_messages is known, and only rows
+        # this exact re-append reproduces (content-matched, see
+        # supersede_reproduced_rows's own docstring). Runs on every
+        # append, not just post-resync ones -- harmless no-op the rest of
+        # the time (new_messages on a normal incremental append is brand
+        # new content that can't match any existing row), and doing it
+        # unconditionally here (instead of gating on "was this call
+        # preceded by a resync") is simpler and can't drift out of sync
+        # with _trigger_resync's own bookkeeping.
+        try:
+            superseded_count = self._store.supersede_reproduced_rows(self._session_id, new_messages)
+            if superseded_count:
+                logger.info(
+                    "RLM: resync superseded %d row(s) reproduced by the "
+                    "re-append (session=%s) -- archive-only content not in "
+                    "new_messages was left visible, not tombstoned",
+                    superseded_count, self._session_id,
+                )
+        except Exception:
+            logger.exception(
+                "RLM: supersede_reproduced_rows failed for session=%s -- "
+                "proceeding with the append anyway; duplicates may be "
+                "visible until this is retried successfully, which is "
+                "safer than the alternative (skipping the append and "
+                "losing new content)",
+                self._session_id,
+            )
         try:
             self._store.append_messages(self._session_id, turn_id, new_messages)
             self._persisted_count = len(messages)
@@ -950,22 +1096,14 @@ class RLMContextEngine(ContextEngine):
             )
 
     def _trigger_resync(self) -> None:
-        """Tombstone this session's current rows, then reset the archive
-        cursor to 0 so the caller's subsequent append_messages() re-inserts
-        the full live transcript as the new, fresh (non-superseded) view.
-        Centralized so every resync trigger (shrink-guard, watermark
-        verification failure or error) goes through the same tombstone-
-        before-reset sequence — N2 fix.
+        """Reset the archive cursor to 0 so the caller's subsequent
+        append_messages() re-inserts the full live transcript. Round-18:
+        no longer tombstones here -- _archive_new() does that AFTER it
+        knows what new_messages actually is, matching content rather than
+        blanket-hiding everything (see supersede_reproduced_rows). Still
+        centralized so every resync trigger (shrink-guard, watermark
+        verification failure or error) goes through the same reset.
         """
-        try:
-            self._store.supersede_session(self._session_id)
-        except Exception:
-            logger.exception(
-                "RLM: supersede_session failed for session=%s — resync will "
-                "still proceed, but old rows may remain visible alongside "
-                "the fresh re-insert until this is retried successfully",
-                self._session_id,
-            )
         self._persisted_count = 0
 
     def _verify_resume_watermark(self, messages: List[Dict[str, Any]]) -> None:
@@ -990,14 +1128,14 @@ class RLMContextEngine(ContextEngine):
         check_n = min(5, self._persisted_count, len(messages))
         if check_n <= 0:
             if self._persisted_count > len(messages):
-                # Round-5 review: this bare reset skipped supersede_session()
-                # -- harmless on THIS call (nothing to re-append when the
-                # live transcript is empty), but it leaves untombstoned old
-                # rows behind, and the NEXT on_turn_complete with real
-                # messages then re-appends the whole transcript on top of
-                # them, duplicating exactly like N2. _trigger_resync()
-                # claims every resync trigger goes through it; this was the
-                # counterexample.
+                # Round-5 review: a bare persisted_count reset here, without
+                # going through _trigger_resync(), used to leave the NEXT
+                # on_turn_complete's re-append undedupe'd against old rows
+                # -- duplicating like N2. _trigger_resync() (now just a
+                # cursor reset -- round 18 moved the actual superseding into
+                # _archive_new(), content-matched against what's really
+                # being re-appended) is the safe default regardless of
+                # whether there's anything to re-append on THIS call.
                 self._trigger_resync()
             return
         try:
@@ -1065,13 +1203,13 @@ class RLMContextEngine(ContextEngine):
             except Exception:
                 logger.exception("RLM: message_count lookup failed on session start")
                 # Round-5 review: same counterexample as the check_n<=0
-                # branch above -- a bare reset here skips supersede_session(),
-                # leaving any real old rows untombstoned for the next append
-                # to duplicate on top of. We don't know if there ARE old
-                # rows (the query that would tell us just failed), so
-                # _trigger_resync() is the safe default regardless; its own
-                # supersede_session() call is independently guarded if the
-                # store is unhappy for the same underlying reason.
+                # branch above -- a bare reset here would leave real old
+                # rows undeduped against the next append. We don't know if
+                # there ARE old rows (the query that would tell us just
+                # failed), so _trigger_resync() (a cursor reset only, since
+                # round 18 -- the actual content-matched supersede happens
+                # in _archive_new() once real messages are known) is the
+                # safe default regardless.
                 self._trigger_resync()
                 self._resume_verified = True
             # Round-9: throttled internally (rlm_meta, not this call site),

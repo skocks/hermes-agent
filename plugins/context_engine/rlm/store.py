@@ -298,12 +298,30 @@ class RLMStore:
             return cur.fetchone()[0] or 0
 
     def supersede_session(self, session_id: str) -> None:
-        """Tombstone every current row for a session before a resync
-        re-inserts the full live transcript as fresh rows. Never deletes --
-        old rows stay physically in the table (see raw_row_count), just
-        excluded from message_count/tail_content/search_any/history()
-        going forward, so a resync stops duplicating what the model
-        actually sees without losing archive-only history in the process.
+        """Tombstone EVERY current row for a session, unconditionally.
+        Never deletes -- old rows stay physically in the table (see
+        raw_row_count), just excluded from message_count/tail_content/
+        search_any/history() going forward.
+
+        Round-18: this is a blunt primitive, not the resync fix. Its own
+        docstring used to claim a resync using this "stops duplicating
+        ... without losing archive-only history in the process" -- false,
+        and the false claim went unverified for 8 rounds: if the live
+        transcript being re-archived after this call is a DROPPED-MIDDLE
+        view (the normal case -- select_context() drops the middle from
+        every request once a session is long enough), the re-append never
+        reproduces the rows this just tombstoned, and content that
+        existed ONLY in the archive is gone from every read path while
+        still physically present -- indistinguishable from data loss to
+        the model, and it produced a fabricated case in a real user
+        deliverable before being caught. See
+        supersede_reproduced_rows() -- engine.py's resync path uses that,
+        not this, for exactly that reason. This method is still correct
+        and still used directly for cases where "hide literally
+        everything for this session" IS the intent (round-9's orphan
+        sweep does not call this at all -- it deletes; test fixtures that
+        want a fully-hidden session for setup purposes are the real
+        remaining callers).
         """
         with self._lock:
             self._conn.execute(
@@ -316,6 +334,54 @@ class RLMStore:
                     (session_id,),
                 )
             self._conn.commit()
+
+    def supersede_reproduced_rows(self, session_id: str, messages: List[Dict[str, Any]]) -> int:
+        """Round-18 fix: tombstone only the rows a resync's re-append will
+        actually REPRODUCE, not every current row. supersede_session()'s
+        blanket tombstone was wrong for exactly the case a resync always
+        hits when it fires on a long session: the live transcript being
+        re-archived has already had its middle dropped by select_context
+        (the normal, expected state, not an edge case) -- so a blanket
+        tombstone-then-reappend permanently hides everything the re-append
+        doesn't cover, even though it was never deleted. That's what
+        happened in production: 152 tombstoned rows in one session, 88 of
+        them unique nowhere else, one of them the specific fact a later
+        turn confidently reported as absent.
+
+        Matches on (role, content) against `messages` (the messages about
+        to be re-appended) -- only rows that match get superseded. Content
+        the live transcript no longer contains is left superseded=0 and
+        stays visible: that's precisely the archive-only history this
+        store exists to hold, not a bug to route around.
+
+        Returns the number of rows actually superseded, for the caller to
+        log/verify.
+        """
+        if not messages:
+            return 0
+        pairs = {(m.get("role", "unknown"), _stringify(m)) for m in messages}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, role, content FROM rlm_messages "
+                "WHERE session_id = ? AND superseded = 0",
+                (session_id,),
+            ).fetchall()
+            to_supersede = [r[0] for r in rows if (r[1], r[2]) in pairs]
+            if to_supersede:
+                for i in range(0, len(to_supersede), 500):
+                    batch = to_supersede[i : i + 500]
+                    placeholders = ",".join("?" * len(batch))
+                    self._conn.execute(
+                        f"UPDATE rlm_messages SET superseded = 1 WHERE id IN ({placeholders})",
+                        batch,
+                    )
+                    if self._fts_enabled:
+                        self._conn.execute(
+                            f"UPDATE rlm_search SET superseded = 1 WHERE rowid IN ({placeholders})",
+                            batch,
+                        )
+                self._conn.commit()
+        return len(to_supersede)
 
     def tail_content(self, session_id: str, n: int) -> List[str]:
         """Content of the last n archived rows (current view only, oldest-
