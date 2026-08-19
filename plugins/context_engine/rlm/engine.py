@@ -175,7 +175,31 @@ class RLMContextEngine(ContextEngine):
         self._tail_token_fraction: float = float(
             cfg.get("tail_token_budget_fraction", _DEFAULT_TAIL_TOKEN_BUDGET_FRACTION)
         )
-        self._marker_role: str = cfg.get("marker_role", "system")
+        # Round-11 production break: the marker is inserted mid-conversation
+        # (system + head + [marker] + tail -- see select_context()/
+        # compress()), never at index 0. A role=='system' message anywhere
+        # but index 0 is a hard 400 on strict OpenAI-compatible chat
+        # templates ("System message must be at the beginning") -- a known
+        # class in this codebase (title_generator.py #48338), not a
+        # provider quirk. Default changed 'system' -> 'user': the marker is
+        # informational text for the model, not a system instruction, and
+        # every template accepts a mid-conversation user-role message.
+        # Kept configurable (some future role, e.g. a template with its own
+        # "note" role, is plausible) but 'system' specifically is refused
+        # below -- it is never valid for THIS position, not merely
+        # provider-dependent, so silently honoring it would reintroduce
+        # this exact outage from config alone.
+        _marker_role_cfg = cfg.get("marker_role", "user")
+        if _marker_role_cfg == "system":
+            logger.warning(
+                "RLM: rlm.marker_role='system' in config, but the marker is "
+                "inserted mid-conversation, never at index 0 -- strict chat "
+                "templates reject that unconditionally, this is not a "
+                "provider-specific tolerance. Coercing to 'user' this run; "
+                "fix rlm.marker_role in config.yaml."
+            )
+            _marker_role_cfg = "user"
+        self._marker_role: str = _marker_role_cfg
         self._repl_timeout: float = float(cfg.get("repl_timeout_seconds", 90.0))
         self._repl_query_timeout: float = float(cfg.get("repl_query_timeout_seconds", 60.0))
         self._repl_max_output_chars: int = int(cfg.get("repl_max_output_chars", 8000))
@@ -413,7 +437,9 @@ class RLMContextEngine(ContextEngine):
         dropped = len(rest) - len(head) - len(tail)
         if dropped <= 0:
             return messages
-        return system + head + [self._dropped_marker(dropped)] + tail
+        return _enforce_system_message_position(
+            system + head + [self._dropped_marker(dropped)] + tail
+        )
 
     # -- the actual mechanism --------------------------------------------------
 
@@ -463,7 +489,7 @@ class RLMContextEngine(ContextEngine):
             if recall is not None:
                 marker = {"role": self._marker_role, "content": marker["content"] + "\n\n" + recall}
 
-        return system + head + [marker] + tail
+        return _enforce_system_message_position(system + head + [marker] + tail)
 
     # -- forced recovery: doesn't wait to be asked ----------------------------
 
@@ -884,6 +910,40 @@ class RLMContextEngine(ContextEngine):
             except Exception:
                 pass
         return status
+
+
+def _enforce_system_message_position(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Round-11 production break: strict OpenAI-compatible chat templates
+    reject a request where a role=='system' message isn't the very first
+    message ("System message must be at the beginning") -- a known class
+    in this codebase (title_generator.py's #48338 finding), not a
+    provider-specific quirk. select_context()/compress() build
+    system + head + [marker] + tail themselves, so nothing but index 0
+    should ever be role=='system' -- checked here structurally rather
+    than trusted, because a malformed list on this path is a hard 400
+    that aborts the user's turn outright, not a degraded-but-working
+    response the model could route around.
+
+    Coerces any offending message's role to 'user' (copying the dict,
+    never mutating the original -- these are shared with the live
+    conversation/archive) rather than only logging: shipping the broken
+    request anyway after detecting it defeats the point of the check.
+    Should never actually trigger post-fix (marker_role's own 'system'
+    guard in __init__ is the primary fix); this is the backstop for
+    anything that reaches this point some other way in the future.
+    """
+    fixed = []
+    for i, m in enumerate(messages):
+        if i > 0 and isinstance(m, dict) and m.get("role") == "system":
+            logger.error(
+                "RLM: a non-first message had role='system' (index %d of %d) "
+                "-- coerced to 'user' to avoid a hard 400 from strict chat "
+                "templates. This should never happen; investigate.",
+                i, len(messages),
+            )
+            m = {**m, "role": "user"}
+        fixed.append(m)
+    return fixed
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:

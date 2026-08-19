@@ -1808,11 +1808,18 @@ DEFAULT_CONFIG = {
         # protect_last_n's message count would otherwise allow it.
         "tail_token_budget_fraction": 0.5,
         # Role used for the synthetic "N messages omitted" marker inserted
-        # where the dropped middle used to be. "system" works for
-        # OpenAI-compatible chat_completions backends (the default here);
-        # switch to "user" for providers that reject multiple system-role
-        # messages in one request.
-        "marker_role": "system",
+        # where the dropped middle used to be. The marker always lands
+        # mid-conversation (after protect_first_n), never at index 0 --
+        # setting this to "system" is a real production outage, not a
+        # provider tolerance question: strict OpenAI-compatible chat
+        # templates unconditionally reject a system-role message that
+        # isn't first ("System message must be at the beginning"; see
+        # title_generator.py's #48338 finding, the same known class hit
+        # RLM in round-11's live break). The engine refuses "system" here
+        # and coerces to "user" at load time regardless of what's
+        # configured -- this default just avoids the warning that
+        # coercion logs every startup.
+        "marker_role": "user",
         # SQLite file archiving every message dropped from context.
         # Default: <hermes home>/rlm.db (next to config.yaml).
         "db_path": "",

@@ -1069,3 +1069,113 @@ def test_sweep_vacuum_gated_by_deleted_rows_and_min_vacuum_interval(tmp_path):
     assert r3["sessions_pruned"] == 1
     assert r3["vacuumed"] is False, "min_vacuum_interval_days must throttle even with fresh deletes"
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round-11: production break. marker_role defaulted to 'system', but the
+# marker lands mid-conversation (system + head + [marker] + tail) -- a
+# role=='system' message anywhere but index 0 is a hard 400 on strict
+# OpenAI-compatible chat templates ("System message must be at the
+# beginning"), not a provider quirk (title_generator.py #48338). Needed
+# > protect_first_n + protect_last_n (28 by default) messages before
+# select_context drops anything -- _convo(60) clears that; every earlier
+# round's fixtures didn't, which is why 10 rounds of tests missed this.
+# ---------------------------------------------------------------------------
+
+def _assert_no_midlist_system_role(messages):
+    for i, m in enumerate(messages):
+        if i > 0:
+            assert m.get("role") != "system", (
+                f"message at index {i} has role='system' -- strict chat "
+                f"templates reject any system-role message that isn't first"
+            )
+
+
+def test_select_context_output_never_has_system_role_after_index_0(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    selected = engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    assert selected is not None, "fixture must actually exercise the drop path"
+    _assert_no_midlist_system_role(selected)
+
+
+def test_select_context_auto_recall_marker_never_has_system_role(tmp_path):
+    """The recall snippet rebuilds the marker at a second call site
+    (marker = {"role": self._marker_role, ...}) -- same invariant, second
+    construction site, must be covered independently of the plain-marker
+    path above.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine._archive_new(convo, turn_id=1)
+    # Force the recall branch: real keywords, and a store hit guaranteed
+    # by seeding an archived row containing them.
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": "xylophone marmalade"}])
+    selected = engine.select_context(
+        convo, conversation_messages=convo,
+        incoming_message={"role": "user", "content": "tell me about xylophone marmalade again"},
+        budget_tokens=131072,
+    )
+    assert selected is not None
+    _assert_no_midlist_system_role(selected)
+
+
+def test_compress_output_never_has_system_role_after_index_0(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    compressed = engine.compress(convo, force=True)
+    assert len(compressed) < len(convo), "fixture must actually exercise the drop path"
+    _assert_no_midlist_system_role(compressed)
+
+
+def test_marker_role_configured_as_system_is_coerced_to_user(tmp_path, caplog):
+    """The dangerous config value itself must be refused, not just papered
+    over downstream -- marker_role: system in config.yaml must not be
+    able to reintroduce this outage.
+    """
+    import logging
+    with caplog.at_level(logging.WARNING, logger="plugins.context_engine.rlm.engine"):
+        engine = _make_engine(tmp_path, marker_role="system")
+    assert engine._marker_role == "user"
+    assert any("marker_role" in r.message for r in caplog.records), (
+        "coercion must be logged, not silent"
+    )
+
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    convo = _convo(60)
+    selected = engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    assert selected is not None
+    _assert_no_midlist_system_role(selected)
+
+
+def test_marker_role_user_configured_explicitly_is_respected(tmp_path):
+    """Coercion must be specific to 'system', not a blanket override --
+    a deliberately configured non-default-but-safe role still applies.
+    """
+    engine = _make_engine(tmp_path, marker_role="user")
+    assert engine._marker_role == "user"
+
+
+def test_enforce_system_message_position_does_not_mutate_original_dict(tmp_path):
+    """The fix copies the offending message rather than mutating it in
+    place -- these dicts are shared with the live conversation/archive,
+    so an in-place role flip would corrupt state well beyond this list.
+    """
+    from plugins.context_engine.rlm.engine import _enforce_system_message_position
+
+    offender = {"role": "system", "content": "should never happen"}
+    original = dict(offender)
+    fixed = _enforce_system_message_position([{"role": "system", "content": "ok"}, offender])
+
+    assert fixed[1]["role"] == "user"
+    assert offender == original, "the original message dict must be untouched"
