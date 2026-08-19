@@ -1143,6 +1143,188 @@ def test_compress_output_never_has_system_role_after_index_0(tmp_path):
     _assert_no_midlist_system_role(compressed)
 
 
+# ---------------------------------------------------------------------------
+# Round-16: (1) accurate automatic-compaction status, not borrowed
+# summarization language; (2) compress()'s log no longer self-accuses
+# select_context() of a failure it is structurally incapable of
+# preventing (it bounds requests, not the transcript preflight measures);
+# (3) compress() must reset _tail_boundary, or the request immediately
+# after a safety-net trim is nearly empty -- reproduced live by the
+# reviewing agent against the round-15-only code (200 msgs -> boundary
+# 160 -> compress() to 30 msgs -> next select_context() tail collapsed to
+# 3 messages via min(boundary, n) clamping a now-meaningless index).
+# ---------------------------------------------------------------------------
+
+def test_automatic_compaction_status_is_accurate_not_summarization_language(tmp_path):
+    engine = _make_engine(tmp_path)
+    for phase in ("preflight", "compress"):
+        msg = engine.get_automatic_compaction_status_message(
+            phase=phase, default_message="should not appear", approx_tokens=12345,
+        )
+        assert msg is not None, "silence was considered and rejected -- see the docstring"
+        # Deliberately allows "not summarizing" (an accurate denial) --
+        # what must never appear is the OLD claim that summarization is
+        # what's happening.
+        assert "summarizing earlier conversation" not in msg.lower(), (
+            "RLM never summarizes -- must not claim to"
+        )
+        assert "archiv" in msg.lower() or "lost" in msg.lower(), (
+            "must say something true about what actually happens (archived/not lost)"
+        )
+    # Deliberate choice, not the silence path -- must not be flipped off.
+    assert engine.emit_automatic_compaction_status is True
+
+
+def test_compress_still_archives_before_trimming(tmp_path):
+    """The reworded log message must not have accidentally dropped the
+    actual archiving behavior -- compress() must still persist everything
+    before trimming the live list.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    compressed = engine.compress(convo, force=True)
+    assert len(compressed) < len(convo)
+    assert engine._store.message_count("s1") == len(convo), (
+        "every message must be archived BEFORE compress() trims the live list"
+    )
+
+
+def test_compress_resets_boundary_so_the_next_request_still_has_a_real_tail(tmp_path):
+    """End-to-end reproduction of the reviewer's exact finding: a stale
+    _tail_boundary surviving compress()'s transcript rewrite doesn't
+    crash (the existing min(boundary, n) clamp prevents that) but silently
+    collapses the next request's tail to almost nothing -- precisely when
+    the conversation is longest and the model needs recent context most.
+    'Consistent' here means more than 'boundary is a valid index': it
+    means the FIRST select_context() call against the post-compress
+    transcript still returns a tail sized like a normal one (>=
+    protect_last_n) and containing the transcript's actual latest
+    message -- not merely that nothing crashes.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    # Advance the boundary well past 0 first, matching the reviewer's repro.
+    convo = [{"role": "system", "content": "sys"}] + [
+        {"role": "user", "content": f"m{i}"} for i in range(200)
+    ]
+    engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    assert engine._tail_boundary > 0, "fixture must actually advance the boundary first"
+
+    compressed = engine.compress(convo, force=True)
+    assert engine._tail_boundary == 0, (
+        "compress() must reset the boundary -- it just rewrote the transcript "
+        "the old boundary was an index into"
+    )
+
+    # Grow the (now much shorter) transcript again, past drop_chunk_size,
+    # so this exercises a REAL drop after compress() -- not the case where
+    # the compressed transcript alone is still small enough that nothing
+    # needs dropping.
+    grown = compressed + [{"role": "user", "content": f"new{i}"} for i in range(40)]
+    selected = engine.select_context(grown, conversation_messages=grown, budget_tokens=131072)
+    assert selected is not None, "fixture must actually exercise the drop path post-compress"
+
+    marker_idx = next(i for i, m in enumerate(selected) if "[RLM:" in (m.get("content") or ""))
+    tail = selected[marker_idx + 1 :]
+    assert len(tail) >= engine.protect_last_n, (
+        "the tail right after a compress() reset must be a REAL tail, not "
+        "collapsed by a stale boundary clamped against the new, shorter transcript"
+    )
+    assert grown[-1] in tail, "the transcript's actual latest message must be reachable"
+
+
+def test_persisted_count_resyncs_consistently_after_compress_shrinks_transcript(tmp_path):
+    """compress() shrinks the live list; the NEXT _archive_new() call (via
+    select_context's M4 archiving) must detect that shrink and resync
+    rather than silently under- or over-counting what's archived. This is
+    the existing shrink-guard (_trigger_resync, N2/M6) -- confirming it's
+    the intended handler for compress()'s shrink specifically, not an
+    accidental side effect.
+
+    'Consistent' here means: after the resync, _persisted_count equals
+    the length of the (post-compress) live transcript select_context was
+    just given -- not the pre-compress count, and not left stale.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    assert engine._persisted_count == len(convo)
+
+    compressed = engine.compress(convo, force=True)
+    assert engine._persisted_count == len(convo), (
+        "compress() itself archives the FULL pre-trim transcript before "
+        "shrinking it -- persisted_count reflects that until the next call"
+    )
+
+    # The next request carries the shrunk transcript -- _archive_new must
+    # notice len(messages) < _persisted_count and resync, not skip
+    # archiving the "new" (actually just repositioned) messages.
+    engine.select_context(compressed, conversation_messages=compressed, budget_tokens=131072)
+    assert engine._persisted_count == len(compressed), (
+        "must resync to the POST-compress transcript length, not stay "
+        "stuck on the stale pre-compress count"
+    )
+
+
+def test_auto_recall_cache_not_incorrectly_reused_after_compress_shrink(tmp_path):
+    """The round-14 drift guard compares _persisted_count against a
+    cached value -- after compress()'s shrink-triggered resync,
+    _persisted_count drops (often below the cached value, making drift
+    negative). Confirms this is harmless, not merely unconsidered: a
+    negative/small drift still passes the '<= protect_last_n' check, but
+    that's fine here specifically because a resync doesn't evict anything
+    a recall would have needed to find -- it just re-establishes the same
+    content under a fresh archive-cursor position.
+    """
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    _seed_recall_match(engine, "s1", "xylophone")
+    incoming = {"role": "user", "content": "tell me about the xylophone marmalade situation"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 1
+        cached_persisted_count = engine._auto_recall_cache[2]
+
+        compressed = engine.compress(convo, force=True)
+        # compress() itself doesn't call _cached_auto_recall_snippet, so
+        # the cache entry (and its stale, larger persisted_count) survives
+        # compress() untouched -- the resync happens on the NEXT call.
+        assert engine._auto_recall_cache[2] == cached_persisted_count
+
+        # Must not raise. Per the reviewer's confirmed reasoning: the
+        # resync this triggers makes _persisted_count drop (often below
+        # cached_persisted_count, so drift goes negative) -- harmless,
+        # not unconsidered, because a resync doesn't evict anything a
+        # recall would have needed: it re-archives the same content under
+        # a fresh cursor, it doesn't lose rows. Negative drift still
+        # passes "<= protect_last_n", so the (still-valid) cached answer
+        # is served rather than recomputed -- confirmed here as the
+        # actual, intended behavior, not merely "didn't crash".
+        engine.select_context(
+            compressed, conversation_messages=compressed, incoming_message=incoming, budget_tokens=131072
+        )
+        assert mocked.call_count == 1, (
+            "a resync-induced negative drift must not force an unnecessary "
+            "recompute -- the archived content itself didn't change"
+        )
+
+
 def test_marker_role_configured_as_system_is_coerced_to_user(tmp_path, caplog):
     """The dangerous config value itself must be refused, not just papered
     over downstream -- marker_role: system in config.yaml must not be

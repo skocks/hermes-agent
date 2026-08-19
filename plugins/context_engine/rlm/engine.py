@@ -375,6 +375,44 @@ class RLMContextEngine(ContextEngine):
     def is_available(self) -> bool:
         return self._store is not None
 
+    # -- round-16: accurate automatic-compaction status ---------------------
+
+    def get_automatic_compaction_status_message(
+        self,
+        *,
+        phase: str,
+        default_message: str,
+        **context: Any,
+    ) -> Optional[str]:
+        """The ABC's default text (both phases: "preflight" before a
+        compaction pass, "compress" for the pass itself) describes LLM
+        summarization -- "This may take a moment", "summarizing earlier
+        conversation". Neither is true for this engine: select_context()
+        drops from the outgoing REQUEST only (nothing summarized, nothing
+        mutated), and compress() (the rare safety net -- see its own
+        docstring) archives-then-trims an already-persisted transcript,
+        no LLM call, no meaningful delay.
+
+        Considered staying silent instead (emit_automatic_compaction_status
+        = False): routine automatic passes are a defensible place for
+        silence, and that's the honest reason to consider it here. Decided
+        against it because this ISN'T rare on a long session -- preflight
+        fires whenever the raw transcript (which select_context()
+        deliberately never touches, see turn_context.py's preflight check)
+        crosses 0.95 * context_length, which every sufficiently long
+        session eventually does BY CONSTRUCTION, dropping the middle of
+        the outgoing request cannot prevent it. A user seeing nothing
+        during a real, recurring pause is worse than a short, true line --
+        so replaced, not silenced.
+        """
+        approx_tokens = context.get("approx_tokens")
+        tokens_str = f"~{approx_tokens:,} tokens " if approx_tokens else ""
+        if phase == "preflight":
+            return f"📦 RLM: trimming {tokens_str}from the request (already archived, nothing lost)."
+        if phase == "compress":
+            return "🗜️ RLM: trimming an already-archived transcript — not summarizing, nothing lost."
+        return default_message
+
     # -- identity ----------------------------------------------------------
 
     @property
@@ -454,9 +492,25 @@ class RLMContextEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> List[Dict[str, Any]]:
-        logger.warning(
-            "RLM: compress() safety net triggered (session=%s, %d messages) — "
-            "select_context() should have prevented this; investigate.",
+        # Round-16: this used to log a warning claiming select_context()
+        # "should have prevented this" -- false, and misleading enough to
+        # waste a future reader's time chasing a bug that doesn't exist.
+        # select_context() shrinks the outgoing REQUEST; the preflight
+        # check that calls compress() measures the raw TRANSCRIPT (see
+        # turn_context.py), which select_context() deliberately never
+        # touches (nothing may leak across turns via the live list). The
+        # transcript therefore grows unbounded regardless of how
+        # aggressively requests are trimmed, and every long session
+        # crosses the preflight threshold eventually, by construction --
+        # dropping sooner cannot prevent that. This IS the expected,
+        # periodic maintenance this safety net exists for on a long
+        # session, not a sign select_context() failed. Info, not warning.
+        logger.info(
+            "RLM: compress() safety-net trim on a long session (session=%s, "
+            "%d transcript messages) -- expected periodic maintenance, not "
+            "a select_context() failure (it bounds requests, not the "
+            "transcript). Archiving then trimming; nothing is summarized "
+            "or lost.",
             self._session_id, len(messages),
         )
         if len(messages) <= self.protect_first_n + self.protect_last_n + 1:
@@ -485,6 +539,24 @@ class RLMContextEngine(ContextEngine):
         dropped = len(rest) - len(head) - len(tail)
         if dropped <= 0:
             return messages
+        # Round-16/round-15 interaction: compress() just replaced the LIVE
+        # transcript with a much shorter one (system + head + marker +
+        # tail) -- self._tail_boundary is an absolute index into the OLD,
+        # larger non-system list, and is now meaningless against the new
+        # one. Left alone, min(boundary, n) in _select_tail() would clamp
+        # it to the new (small) length, producing an EMPTY tail on the
+        # very next select_context() call -- a silent desync, not a clean
+        # reprefill. compress() already forces a full transcript reshape
+        # (a real, unavoidable reprefill -- the safety net exists BECAUSE
+        # the request must shrink right now), so resetting the boundary
+        # here doesn't add a new cache cost, it just makes the ALREADY-
+        # necessary reprefill happen cleanly instead of leaving a broken
+        # boundary for the next call to trip over. 0 is correct, not just
+        # convenient: it's the same "nothing dropped yet" state a brand
+        # new session starts in, and _select_tail()'s own quantization
+        # naturally recomputes the right thing from there against the new
+        # (much smaller) transcript on the next call.
+        self._tail_boundary = 0
         return _enforce_system_message_position(
             system + head + [self._dropped_marker()] + tail
         )
