@@ -1846,6 +1846,11 @@ DEFAULT_CONFIG = {
         # entirely. "" = hermes' `delegation.base_url` if repl_query_model
         # came from there, else the root model's base_url.
         "repl_query_base_url": "",
+        # api_mode paired with repl_query_model the same way -- a delegation
+        # endpoint can be shaped differently than root's (chat_completions
+        # vs. something else). "" = hermes' `delegation.api_mode` if
+        # repl_query_model came from there, else root's api_mode.
+        "repl_query_api_mode": "",
         # Auto-recall: forced (not voluntary) recovery. Every turn past the
         # drop threshold, a cheap keyword check against the incoming user
         # message decides whether dropped history plausibly matters here --

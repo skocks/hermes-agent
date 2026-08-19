@@ -78,23 +78,46 @@ RLM_REPL_SCHEMA = {
         "the RLM context engine dropped from the visible context to keep "
         "the prompt small. History is archived, never deleted — use this "
         "before assuming something from earlier in the conversation is "
-        "gone. State persists across calls within this session: a "
-        "variable you set now is still there next time you call this.\n"
-        "Pre-loaded in the REPL namespace:\n"
+        "gone. State persists across calls within this session (a "
+        "variable you set now is still there next time you call this) "
+        "but is NOT reliable long-term: a timeout, a crash, or a /model "
+        "switch silently wipes it. Write code that can re-derive what it "
+        "needs (e.g. from context/history()) rather than code that "
+        "assumes an earlier variable is still set.\n"
+        "Pre-loaded in the REPL namespace, refreshed at the start of "
+        "every call (so context always reflects the current archive, "
+        "not a stale snapshot from when the REPL first started):\n"
         "- context: a plain Python list of dicts (turn_id, role, content, "
-        "ts), a snapshot of this session's archive taken when the REPL "
-        "started. Slice/filter/search it with ordinary Python — indexing, "
-        "list comprehensions, regex — no query language needed.\n"
+        "ts), oldest-first (chronological). Slice/filter/search it with "
+        "ordinary Python — indexing, list comprehensions, regex — no "
+        "query language needed.\n"
+        "- context_total: how many messages are actually archived. "
+        "context_truncated: True if context holds fewer than that (capped "
+        "at 5000) — check this before assuming context is everything.\n"
         "- history(where='1=1', order_by='id DESC', limit=100) -> same "
-        "shape as context, but re-queried live — use this to pick up "
-        "messages archived after the REPL started (context won't include "
-        "those). where/order_by are SQL fragments over turn_id, role, "
+        "shape as context. Use this for anything context's defaults don't "
+        "cover — a different order, a smaller/targeted slice, a SQL "
+        "predicate. where/order_by are SQL fragments over turn_id, role, "
         "content, ts — scoped to this session automatically, you cannot "
         "see another session's rows.\n"
         "- rlm_query(prompt, system=..., max_tokens=500) -> str. Calls "
         "the language model itself — use this to digest/summarize a "
         "large result BEFORE printing it, so your own output (which is "
         "capped) stays useful instead of getting truncated.\n"
+        "- reset() -> clears every variable you've set (keeping context/"
+        "history/rlm_query/code_log/reset). Call this when starting an "
+        "unrelated task so leftover variables from an earlier one (chunks, "
+        "summary, results, ...) can't silently leak into it. If a call's "
+        "output ends with a '[REPL: N name(s) from earlier call(s) still "
+        "live: ...]' line, that's this happening — decide whether those "
+        "names still matter or call reset().\n"
+        "- code_log(n=20) -> the actual Python source of your last n calls "
+        "in this REPL, most recent last. Variables and functions persist "
+        "across turns, but root's visible chat context does not (older "
+        "turns get dropped to keep the prompt small) — by the time a "
+        "function from many turns ago is still callable, the turn that "
+        "defined it may be gone from what you can see. Use this to recover "
+        "what actually created your current state.\n"
         "Write ordinary Python: loops, filtering, string/regex work, "
         "whatever the task needs — this is not a fixed set of query "
         "modes, decompose the problem however fits."
@@ -132,6 +155,12 @@ class RLMContextEngine(ContextEngine):
         # Explicit rlm.repl_query_model still overrides both.
         self._repl_query_model: str = cfg.get("repl_query_model") or _delegation_cfg.get("model", "")
         self._repl_query_base_url: str = cfg.get("repl_query_base_url") or _delegation_cfg.get("base_url", "")
+        # Introduced by the M2 fix, caught in round-2 audit (R5): model and
+        # base_url can come from delegation:, but api_mode was still always
+        # root's -- if delegation points at a differently-shaped endpoint
+        # than root, rlm_query() would wrongly inherit root's api_mode and
+        # either mis-send or hit the H2 NotImplementedError for no reason.
+        self._repl_query_api_mode: str = cfg.get("repl_query_api_mode") or _delegation_cfg.get("api_mode", "")
         # Auto-recall: forced (not voluntary) recovery. Every turn past the
         # drop threshold, select_context() itself checks whether the
         # incoming user message plausibly needs dropped history (cheap
@@ -151,6 +180,16 @@ class RLMContextEngine(ContextEngine):
 
         self._session_id: str = "unknown"
         self._persisted_count: int = 0  # how many of the live `messages` we've archived
+        # Best-effort turn_id for the M4 mid-turn-archiving fix: messages
+        # archived from select_context() (before the turn finishes) don't
+        # have a real turn_id yet -- on_turn_complete() provides the real
+        # one, but by the time it fires those messages are usually already
+        # archived (nothing new left to backfill it onto). This tracks
+        # "one past the last CONFIRMED turn_id" as the best guess for
+        # in-progress-turn messages; imprecise during that one turn, never
+        # wrong by more than one, and never a data-loss issue either way —
+        # content is fully archived and searchable regardless of this tag.
+        self._next_turn_id: int = 0
         self._store: Optional[RLMStore] = None
         self._store_error: Optional[str] = None
         self._runtime: Dict[str, str] = {}  # captured in update_model(), used to spawn the REPL
@@ -232,7 +271,11 @@ class RLMContextEngine(ContextEngine):
             # be wrong if delegation pointed at a provider needing its own
             # key different from root's.
             "api_key": api_key or "",
-            "api_mode": api_mode or "",
+            # R5 fix: follows the delegation endpoint when the model/base_url
+            # above did too, same "a different endpoint can be shaped
+            # differently" reasoning as base_url. Falls back to root's
+            # api_mode only when no delegation override is active.
+            "api_mode": (self._repl_query_model and self._repl_query_api_mode) or api_mode or "",
         }
         # A running REPL was bootstrapped with the OLD model/base_url —
         # restart it so a mid-session /model switch takes effect. Losing
@@ -318,6 +361,18 @@ class RLMContextEngine(ContextEngine):
             # before anything else in this method.
             return None
         convo = conversation_messages or []
+
+        # M4 fix: archive here too, not just at on_turn_complete(). This
+        # method runs on every provider request, including mid-turn
+        # tool-calling round trips -- on_turn_complete only fires once the
+        # WHOLE turn finishes. Without this, a message dropped from the
+        # request partway through a long tool-calling turn genuinely isn't
+        # in SQLite yet: rlm_repl can't retrieve it even though the marker
+        # promises it can. _archive_new() is idempotent (only appends what's
+        # new since the last call), so calling it here every request is
+        # safe, not a growing duplicate cost.
+        self._archive_new(convo, turn_id=self._next_turn_id)
+
         non_system = [m for m in convo if m.get("role") != "system"]
         if len(non_system) <= self.protect_first_n + self.protect_last_n:
             return None  # nothing to drop yet — leave the request untouched
@@ -520,7 +575,15 @@ class RLMContextEngine(ContextEngine):
         usage: Dict[str, Any] = None,
         **kwargs: Any,
     ) -> None:
-        self._archive_new(messages, turn_id=kwargs.get("turn_id", -1))
+        turn_id = kwargs.get("turn_id", self._next_turn_id)
+        self._archive_new(messages, turn_id=turn_id)
+        # Best-effort tracker for select_context()'s mid-turn archiving
+        # (M4 fix) -- advance past whatever turn just confirmed-finished.
+        try:
+            if int(turn_id) >= self._next_turn_id:
+                self._next_turn_id = int(turn_id) + 1
+        except (TypeError, ValueError):
+            self._next_turn_id += 1
 
     # -- session lifecycle ---------------------------------------------------
 
@@ -547,6 +610,7 @@ class RLMContextEngine(ContextEngine):
                 self._persisted_count = 0
         else:
             self._persisted_count = 0
+        self._next_turn_id = 0
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         if self._repl is not None:
@@ -569,6 +633,7 @@ class RLMContextEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._persisted_count = 0
+        self._next_turn_id = 0
         if self._repl is not None:
             self._repl.close()
             self._repl = None

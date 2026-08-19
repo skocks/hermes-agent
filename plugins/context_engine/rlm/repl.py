@@ -55,6 +55,19 @@ API_KEY = os.environ.get("RLM_API_KEY", "")
 
 _ns = {{}}
 
+def _archive_count():
+    """COUNT(*), not len(history(limit=big)) -- refreshed every exec() call
+    now (see _refresh_context below), so this stays a cheap indexed count
+    rather than fetching up to a million rows just to measure them."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM rlm_messages WHERE session_id = ?", (SESSION_ID,)
+        )
+        return cur.fetchone()[0]
+    finally:
+        conn.close()
+
 def history(where="1=1", limit=100, order_by="id DESC"):
     """Query this session's archived messages. where/order_by are raw SQL
     fragments over columns turn_id, role, content, ts -- scoped to this
@@ -129,12 +142,66 @@ _ns["sqlite3"] = sqlite3
 # without any signal that something's off. context_total/context_truncated
 # make the 5000-row cap visible instead of silent -- a model reasonably
 # assumes "context" means "everything" unless told otherwise.
-context_total = len(history(limit=1_000_000))
-context = history(limit=5000, order_by="id ASC")
-context_truncated = context_total > len(context)
-_ns["context"] = context
-_ns["context_total"] = context_total
-_ns["context_truncated"] = context_truncated
+#
+# Rebound at the top of EVERY exec(), not just once at process start: this
+# REPL now lives for the whole session (a deliberate improvement on the
+# paper's per-query REPL), so a context bound once at startup would go
+# stale the moment anything gets archived after the first rlm_repl call --
+# in a long session that shifts topic, that's precisely the newly-relevant
+# history silently missing. Reassigning these three names doesn't touch
+# any other variable the model has set.
+def _refresh_context():
+    total = _archive_count()
+    ctx = history(limit=5000, order_by="id ASC")
+    _ns["context"] = ctx
+    _ns["context_total"] = total
+    _ns["context_truncated"] = total > len(ctx)
+
+_refresh_context()
+
+_call_index = 0
+_var_seen_at = {{}}   # name -> call index it first appeared, for the staleness footer
+_code_log = []        # [(call_index, code), ...] -- provenance survives even after
+                       # select_context() drops the turn that created a binding from
+                       # root's visible context; the binding stays callable, but
+                       # without this its origin would be unrecoverable.
+_CODE_LOG_MAX = 200
+
+def code_log(n=20):
+    """Source of the last n exec() calls in this REPL session, as
+    (call_index, code) pairs, most recent last. State (variables,
+    functions) persists across turns, but root's visible context does not
+    -- by the time a function defined many turns ago is still callable,
+    its defining code may be long gone from what you can see. Use this to
+    recover the provenance of what created your current state."""
+    return list(_code_log[-int(n):])
+
+# Names/values restored at the top of EVERY exec(), not just present at
+# startup: exec()'s globals dict IS _ns, so model code assigning to
+# history/rlm_query/sqlite3/reset/code_log doesn't create a local shadow,
+# it silently overwrites the real thing for the rest of the session --
+# including reset() itself, the one escape hatch meant to recover from
+# exactly this kind of bad state. A base name a model overwrites is
+# restored before the NEXT call, so shadowing only ever lasts for the one
+# call that did it, never permanently.
+_BASE_BINDINGS = {{
+    "history": history, "rlm_query": rlm_query, "sqlite3": sqlite3,
+    "reset": None, "code_log": code_log,  # reset assigned just below (refers to itself)
+}}
+
+def reset():
+    """Clear all variables/imports from earlier in this session, keeping
+    only history/rlm_query/context/reset/code_log. Use this when starting
+    on an unrelated task so old variables can't leak into it by accident."""
+    for k in list(_ns.keys()):
+        if k not in _BASE_BINDINGS and k != "__builtins__":
+            del _ns[k]
+    _var_seen_at.clear()
+    _refresh_context()
+    return "REPL namespace reset."
+
+_BASE_BINDINGS["reset"] = reset
+_ns.update(_BASE_BINDINGS)
 
 for line in sys.stdin:
     line = line.strip()
@@ -145,6 +212,9 @@ for line in sys.stdin:
     except Exception:
         continue
     code = req.get("code", "")
+    _call_index += 1
+    _ns.update(_BASE_BINDINGS)  # restore anything the model clobbered last call
+    _refresh_context()
     buf = io.StringIO()
     result = {{"stdout": "", "error": None}}
     try:
@@ -152,7 +222,29 @@ for line in sys.stdin:
             exec(compile(code, "<rlm_repl>", "exec"), _ns)
     except Exception:
         result["error"] = traceback.format_exc(limit=6)
-    result["stdout"] = buf.getvalue()
+
+    _code_log.append((_call_index, code))
+    del _code_log[:-_CODE_LOG_MAX]
+
+    stale_names = []
+    for k in _ns:
+        if k in _BASE_BINDINGS or k in ("context", "context_total", "context_truncated", "__builtins__"):
+            continue  # __builtins__ is auto-injected by exec(), not a user variable
+        if k not in _var_seen_at:
+            _var_seen_at[k] = _call_index
+        if _var_seen_at[k] < _call_index:
+            stale_names.append(k)
+
+    stdout_text = buf.getvalue()
+    if stale_names:
+        shown = ", ".join(sorted(stale_names)[:10])
+        more = f" (+{{len(stale_names) - 10}} more)" if len(stale_names) > 10 else ""
+        stdout_text += (
+            f"\\n[REPL: {{len(stale_names)}} name(s) from earlier call(s) still "
+            f"live: {{shown}}{{more}} -- call reset() if this task is unrelated "
+            "to whatever set them, or code_log() to see what did]"
+        )
+    result["stdout"] = stdout_text
     sys.stdout.write(json.dumps(result) + "\\n")
     sys.stdout.flush()
 '''
