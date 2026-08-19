@@ -39,6 +39,20 @@ class TestDoctorPlatformHints:
 
         assert "run `hermes update`" in hint
 
+    def test_sqlite_upgrade_hint_uses_pkg_for_apt_managed_install(self):
+        hint = doctor._sqlite_upgrade_hint("apt")
+
+        assert "run `pkg upgrade hermes-agent`" in hint
+        assert "hermes update" not in hint
+
+    def test_sqlite_upgrade_hint_preserves_nix_guidance_as_prose(self):
+        guidance = doctor.recommended_update_command_for_method("nix")
+        hint = doctor._sqlite_upgrade_hint("nix")
+
+        assert guidance in hint
+        assert f"run `{guidance}`" not in hint
+        assert "hermes update" not in hint
+
 
 class TestProviderEnvDetection:
     def test_detects_openai_api_key(self):
@@ -411,6 +425,142 @@ def test_run_doctor_accepts_stable_key_when_provider_name_differs(
     assert "model.provider 'custom:local-127.0.0.1:11434' is unknown" not in out
 
 
+def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: custom\n"
+        "  default: local-model\n"
+        "  base_url: http://localhost:8000/v1\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "model.provider 'custom' is not a recognised provider" not in out
+
+
+def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: openai/gpt-4.1-mini\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_minimax_oauth_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_gemini_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "model.provider 'openrouter' is set but no API key is configured" in out
+    assert "No credentials found for provider 'openrouter'." in out
+
+
+@pytest.mark.parametrize(
+    ("provider", "default_model"),
+    [
+        ("ai-gateway", "anthropic/claude-sonnet-4.6"),
+        ("opencode-zen", "anthropic/claude-sonnet-4.6"),
+        ("kilocode", "anthropic/claude-sonnet-4.6"),
+        ("kimi-coding", "kimi-k2"),
+        ("nvidia", "qwen/qwen3.5-122b-a10b"),
+        ("moa", "anthropic/claude-sonnet-4.6"),
+    ],
+)
+def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
+    monkeypatch, tmp_path, provider, default_model
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        f"  provider: {provider}\n"
+        f"  default: {default_model}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert f"model.provider '{provider}' is not a recognised provider" not in out
+    assert f"model.provider '{provider}' is unknown" not in out
+    if provider in {"ai-gateway", "opencode-zen", "kilocode", "nvidia"}:
+        assert (
+            f"model.default '{default_model}' uses a vendor/model slug but provider is '{provider}'"
+            not in out
+        )
+
+
 def test_run_doctor_accepts_vendor_slugs_for_named_custom_provider(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
@@ -461,200 +611,6 @@ def test_run_doctor_accepts_vendor_slugs_for_named_custom_provider(monkeypatch, 
 
 
 
-def _run_doctor_with_managed_agent_browser(monkeypatch, tmp_path, runnable):
-    """Set up run_doctor with node present, agent-browser only in the
-    Hermes-managed node bin (~/.hermes/node/bin), not on PATH or in
-    PROJECT_ROOT/node_modules. Returns the captured stdout."""
-    home = tmp_path / ".hermes"
-    (home / "node" / "bin").mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
-    managed_ab = home / "node" / "bin" / "agent-browser"
-    managed_ab.write_text("#!/bin/sh\n", encoding="utf-8")
-    managed_ab.chmod(0o755)
-    project = tmp_path / "project"
-    project.mkdir(exist_ok=True)  # no node_modules/agent-browser here
-
-    monkeypatch.delenv("TERMUX_VERSION", raising=False)
-    monkeypatch.delenv("PREFIX", raising=False)
-    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
-    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
-
-    # node on PATH, agent-browser is NOT on PATH (only in the managed bin).
-    # The managed-dir rung resolves via shutil.which(..., path=<dir>) so
-    # Windows picks the .cmd shim — mirror that shape here.
-    def _fake_which(cmd, path=None):
-        if path is not None:
-            if cmd == "agent-browser" and str(managed_ab.parent) == str(path):
-                return str(managed_ab)
-            return None
-        return "/usr/bin/node" if cmd in {"node", "npm"} else None
-
-    monkeypatch.setattr(doctor_mod.shutil, "which", _fake_which)
-    # agent_browser_runnable is imported into doctor's namespace
-    monkeypatch.setattr(
-        doctor_mod,
-        "agent_browser_runnable",
-        lambda path: runnable and str(path) == str(managed_ab),
-    )
-
-    fake_model_tools = types.SimpleNamespace(
-        check_tool_availability=lambda *a, **kw: ([], []),
-        TOOLSET_REQUIREMENTS={},
-    )
-    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-
-    try:
-        from hermes_cli import auth as _auth_mod
-        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
-    except Exception:
-        pass
-
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        doctor_mod.run_doctor(Namespace(fix=False))
-    return buf.getvalue()
-
-
-
-def test_run_doctor_accepts_bare_custom_provider(monkeypatch, tmp_path):
-    home = tmp_path / ".hermes"
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(
-        "model:\n"
-        "  provider: custom\n"
-        "  default: local-model\n"
-        "  base_url: http://localhost:8000/v1\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
-    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
-    (tmp_path / "project").mkdir(exist_ok=True)
-
-    fake_model_tools = types.SimpleNamespace(
-        check_tool_availability=lambda *a, **kw: ([], []),
-        TOOLSET_REQUIREMENTS={},
-    )
-    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-
-    try:
-        from hermes_cli import auth as _auth_mod
-        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
-    except Exception:
-        pass
-
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        doctor_mod.run_doctor(Namespace(fix=False))
-
-    out = buf.getvalue()
-    assert "model.provider 'custom' is not a recognised provider" not in out
-
-
-def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(monkeypatch, tmp_path):
-    home = tmp_path / ".hermes"
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(
-        "model:\n"
-        "  provider: openrouter\n"
-        "  default: openai/gpt-4.1-mini\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
-    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
-    (tmp_path / "project").mkdir(exist_ok=True)
-
-    fake_model_tools = types.SimpleNamespace(
-        check_tool_availability=lambda *a, **kw: ([], []),
-        TOOLSET_REQUIREMENTS={},
-    )
-    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    try:
-        from hermes_cli import auth as _auth_mod
-
-        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_gemini_oauth_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_minimax_oauth_auth_status", lambda: {})
-    except Exception:
-        pass
-
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        doctor_mod.run_doctor(Namespace(fix=False))
-
-    out = buf.getvalue()
-    assert "model.provider 'openrouter' is set but no API key is configured" in out
-    assert "No credentials found for provider 'openrouter'." in out
-
-
-@pytest.mark.parametrize(
-    ("provider", "default_model"),
-    [
-        ("ai-gateway", "anthropic/claude-sonnet-4.6"),
-        ("opencode-zen", "anthropic/claude-sonnet-4.6"),
-        ("kilocode", "anthropic/claude-sonnet-4.6"),
-        ("kimi-coding", "kimi-k2"),
-    ],
-)
-def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
-    monkeypatch, tmp_path, provider, default_model
-):
-    home = tmp_path / ".hermes"
-    home.mkdir(parents=True, exist_ok=True)
-    (home / "config.yaml").write_text(
-        "model:\n"
-        f"  provider: {provider}\n"
-        f"  default: {default_model}\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
-    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
-    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
-    (tmp_path / "project").mkdir(exist_ok=True)
-
-    fake_model_tools = types.SimpleNamespace(
-        check_tool_availability=lambda *a, **kw: ([], []),
-        TOOLSET_REQUIREMENTS={},
-    )
-    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-
-    try:
-        from hermes_cli import auth as _auth_mod
-        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
-        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
-    except Exception:
-        pass
-
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        doctor_mod.run_doctor(Namespace(fix=False))
-
-    out = buf.getvalue()
-    assert f"model.provider '{provider}' is not a recognised provider" not in out
-    assert f"model.provider '{provider}' is unknown" not in out
-    if provider in {"ai-gateway", "opencode-zen", "kilocode"}:
-        assert (
-            f"model.default '{default_model}' uses a vendor/model slug but provider is '{provider}'"
-            not in out
-        )
-
-
-
-
 def test_run_doctor_accepts_kimi_coding_cn_provider(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)
@@ -679,7 +635,7 @@ def test_run_doctor_accepts_kimi_coding_cn_provider(monkeypatch, tmp_path):
 
     try:
         from hermes_cli import auth as _auth_mod
-        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
         monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
         monkeypatch.setattr(_auth_mod, "get_auth_status", lambda provider: {"logged_in": True})
         monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
@@ -719,7 +675,7 @@ def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser
 
     try:
         from hermes_cli import auth as _auth_mod
-        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
         monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
         monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
     except Exception:
@@ -736,6 +692,110 @@ def test_run_doctor_termux_does_not_mark_browser_available_without_agent_browser
     assert "system dependency not met" in out
     assert "agent-browser is not installed (expected in the tested Termux path)" in out
     assert "npm install -g agent-browser && agent-browser install" in out
+
+
+def _doctor_env_for_agent_browser(monkeypatch, tmp_path):
+    """Shared non-Termux fixture setup for the agent-browser npx-resolution
+    branch in run_doctor (hermes_cli/doctor.py ~1557-1605)."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("PREFIX", "/usr")
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setattr(
+        doctor_mod.shutil,
+        "which",
+        lambda cmd: "/usr/bin/node" if cmd in {"node", "npm"} else None,
+    )
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+
+def test_run_doctor_reports_agent_browser_resolves_via_npx(monkeypatch, tmp_path):
+    """When agent-browser has no local/global install, _find_agent_browser
+    falls through to 'npx agent-browser' — doctor must report that as OK
+    (#43564: agent-browser is no longer a root package.json dependency, so
+    this is the expected common case now, not a warning)."""
+    _doctor_env_for_agent_browser(monkeypatch, tmp_path)
+
+    import tools.browser_tool as bt
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: "npx agent-browser")
+    warm_calls = []
+    monkeypatch.setattr(
+        bt, "warm_agent_browser_npx_cache", lambda *a, **kw: warm_calls.append(1) or True
+    )
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert "agent-browser" in out
+    assert "resolves via npx on first use" in out
+    assert "agent-browser not installed" not in out
+    # --fix was not requested: the warm-up must not fire on a plain check.
+    assert not warm_calls
+
+
+def test_run_doctor_fix_warms_npx_cache_when_agent_browser_resolves_via_npx(
+    monkeypatch, tmp_path
+):
+    """`hermes doctor --fix` must actually call warm_agent_browser_npx_cache()
+    when agent-browser resolves via npx, and report success."""
+    _doctor_env_for_agent_browser(monkeypatch, tmp_path)
+
+    import tools.browser_tool as bt
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: "npx agent-browser")
+    warm_calls = []
+    monkeypatch.setattr(
+        bt, "warm_agent_browser_npx_cache", lambda *a, **kw: warm_calls.append(1) or True
+    )
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=True))
+    out = buf.getvalue()
+
+    assert warm_calls, "warm_agent_browser_npx_cache() must be called under --fix"
+    assert "Warmed npx cache for agent-browser" in out
+    assert "Could not warm npx cache" not in out
+
+
+def test_run_doctor_fix_reports_when_npx_warmup_fails(monkeypatch, tmp_path):
+    """If warm_agent_browser_npx_cache() fails (offline, npx missing from
+    PATH at call time, etc.), doctor must say so instead of silently
+    claiming success — and must not count it as a fix."""
+    _doctor_env_for_agent_browser(monkeypatch, tmp_path)
+
+    import tools.browser_tool as bt
+    monkeypatch.setattr(bt, "_find_agent_browser", lambda **_kw: "npx agent-browser")
+    monkeypatch.setattr(bt, "warm_agent_browser_npx_cache", lambda *a, **kw: False)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=True))
+    out = buf.getvalue()
+
+    assert "Could not warm npx cache (offline or npx unavailable)" in out
+    assert "Warmed npx cache for agent-browser" not in out
 
 
 def test_run_doctor_kimi_cn_env_is_detected_and_probe_is_null_safe(monkeypatch, tmp_path):
