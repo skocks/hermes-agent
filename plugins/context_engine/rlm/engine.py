@@ -75,6 +75,7 @@ must never be able to crash agent startup or a turn.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -228,16 +229,32 @@ class RLMContextEngine(ContextEngine):
         # than root, rlm_query() would wrongly inherit root's api_mode and
         # either mis-send or hit the H2 NotImplementedError for no reason.
         self._repl_query_api_mode: str = cfg.get("repl_query_api_mode") or _delegation_cfg.get("api_mode", "")
-        # Auto-recall: forced (not voluntary) recovery. Every turn past the
-        # drop threshold, select_context() itself checks whether the
+        # Auto-recall: OFF by default (round 13). When enabled, every turn
+        # past the drop threshold, select_context() checks whether the
         # incoming user message plausibly needs dropped history (cheap
         # keyword match against the archive) and, if so, injects a
-        # digested-and-capped snippet directly into the request — no
-        # dependence on the model noticing the marker or choosing to call
-        # rlm_repl. Root is protected regardless of digestion outcome: a
+        # digested-and-capped snippet directly into the request — forced
+        # (not voluntary) recovery, no dependence on the model noticing
+        # the marker or choosing to call rlm_repl itself. Root stays
+        # protected regardless of digestion outcome when it's on: a
         # failed/oversized digest is hard-truncated, never raw, never
         # unbounded — same backstop discipline as the rest of this engine.
-        self._auto_recall: bool = bool(cfg.get("auto_recall", True))
+        #
+        # Why off by default now, when round 1 argued for forcing it: that
+        # argument was strong when the voluntary path (the model calling
+        # rlm_repl itself) was unreliable by construction -- H1's
+        # 15s-vs-60s timeout misconfiguration could kill the REPL before a
+        # real rlm_query() call returned, and the REPL's context variable
+        # went stale after the first call. Both fixed since. With the
+        # voluntary path actually working, the case for spending a
+        # blocking call_llm() digest on the request path to pre-empt the
+        # model asking no longer holds -- it's a real, measured latency
+        # cost (round 13) paid on every qualifying turn whether or not
+        # the model would have needed it. Stays available and fully
+        # supported (round 13 also memoizes it per-turn so anyone who
+        # enables it doesn't pay for N identical digests per turn) --
+        # just no longer the default a fresh install gets.
+        self._auto_recall: bool = bool(cfg.get("auto_recall", False))
         self._auto_recall_min_keyword_len: int = int(cfg.get("auto_recall_min_keyword_len", 4))
         self._auto_recall_max_keywords: int = int(cfg.get("auto_recall_max_keywords", 6))
         self._auto_recall_min_keywords: int = int(cfg.get("auto_recall_min_keywords", 2))
@@ -268,6 +285,18 @@ class RLMContextEngine(ContextEngine):
         # wrong by more than one, and never a data-loss issue either way —
         # content is fully archived and searchable regardless of this tag.
         self._next_turn_id: int = 0
+        # Round-13: select_context() runs on EVERY provider request within
+        # a turn (M4's own premise), and incoming_message never changes
+        # within a turn -- so an unmemoized auto-recall paid for the same
+        # keyword search + digest sub-call once per request, up to N times
+        # for an N-tool-call turn, all blocking on the critical path. One
+        # slot, not a dict: only ever one turn "in flight" per engine
+        # instance. Keyed on a hash of the question TEXT, not the message
+        # dict itself, so this never holds a live reference into the
+        # conversation. See _cached_auto_recall_snippet() for the full
+        # reasoning, including the one subtlety about mid-turn archive
+        # growth that a cached negative could in principle miss.
+        self._auto_recall_cache: Optional[tuple] = None  # (question_hash, snippet_or_None)
         # M6 fix: message_count(session_id) (a raw row total) is what
         # on_session_start uses to guess _persisted_count on resume -- but
         # it's inflatable by the shrink-guard's own past resyncs (each one
@@ -485,13 +514,61 @@ class RLMContextEngine(ContextEngine):
         marker = self._dropped_marker(dropped)
 
         if self._auto_recall and self._store:
-            recall = self._auto_recall_snippet(incoming_message)
+            recall = self._cached_auto_recall_snippet(incoming_message)
             if recall is not None:
                 marker = {"role": self._marker_role, "content": marker["content"] + "\n\n" + recall}
 
         return _enforce_system_message_position(system + head + [marker] + tail)
 
     # -- forced recovery: doesn't wait to be asked ----------------------------
+
+    def _cached_auto_recall_snippet(self, incoming_message: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Round-13: select_context() runs once per provider request, not
+        once per turn (M4's own premise), and incoming_message is the same
+        object for every request within one turn -- without this, a
+        10-tool-call turn paid for 10-11 identical keyword searches AND,
+        worse, up to 10-11 identical blocking call_llm() digest sub-calls
+        on the critical path before dispatch, one per request. Memoized
+        for the life of one turn, keyed on a hash of the question TEXT
+        (never the message dict -- this must not hold a live reference
+        into the conversation). The negative result ("nothing relevant")
+        is cached too: it's the common outcome, and re-running the search
+        for it every request is exactly the waste this exists to remove.
+        Cleared in on_turn_complete()/on_session_start()/on_session_reset()
+        -- nothing survives past the turn or session it was computed in.
+
+        One subtlety, worth stating explicitly rather than assuming it
+        away: _archive_new()/M4 mean the archive GROWS between requests
+        within a turn, so in principle a cached negative computed early in
+        a turn could miss content archived moments later in that SAME
+        turn. This is safe for the common case: anything just archived is,
+        by construction, at the tail of the live transcript
+        (_token_bounded_tail always takes the current trailing
+        protect_last_n messages), so it's already visible to the model
+        directly -- auto-recall was never the mechanism that would have
+        surfaced it. It stops being safe only if a SINGLE turn's own tool
+        round trips add more than protect_last_n new messages before that
+        turn finishes: then content archived early in that turn can roll
+        out of the live tail before on_turn_complete() ever clears the
+        cache, while a stale negative (computed before that content
+        existed, or before it needed recall) keeps suppressing a search
+        that would now find it. Accepted as-is, not patched around: (1)
+        it requires a single turn long enough to itself exceed
+        protect_last_n in new messages, not a general case; (2) the
+        window is self-bounded -- it cannot outlive the turn; (3)
+        rlm_repl remains a fully reliable, voluntary path the model can
+        use directly regardless -- auto-recall is a pre-emptive
+        convenience on top of that, not the only way to reach archived
+        content, and round 13 made auto_recall opt-in specifically
+        because that voluntary path is now trustworthy.
+        """
+        question = _message_text(incoming_message)
+        key = hashlib.sha256(question.encode("utf-8")).hexdigest() if question else None
+        if self._auto_recall_cache is not None and self._auto_recall_cache[0] == key:
+            return self._auto_recall_cache[1]
+        snippet = self._auto_recall_snippet(incoming_message)
+        self._auto_recall_cache = (key, snippet)
+        return snippet
 
     def _auto_recall_snippet(self, incoming_message: Optional[Dict[str, Any]]) -> Optional[str]:
         """Check whether the current turn plausibly needs dropped history,
@@ -759,6 +836,10 @@ class RLMContextEngine(ContextEngine):
                 self._next_turn_id = int(turn_id) + 1
         except (TypeError, ValueError):
             self._next_turn_id += 1
+        # Round-13: the turn this cache was scoped to just ended -- clear
+        # it so the next turn's (possibly identical-looking) question
+        # recomputes rather than reusing this turn's answer.
+        self._auto_recall_cache = None
 
     # -- session lifecycle ---------------------------------------------------
 
@@ -817,6 +898,12 @@ class RLMContextEngine(ContextEngine):
             self._persisted_count = 0
             self._resume_verified = True
         self._next_turn_id = 0
+        # Round-13: a new session must never inherit the previous
+        # session's auto-recall answer -- same reasoning as
+        # on_turn_complete(), one level up (this engine instance is reused
+        # across /new, so without this a stale cross-session cache entry
+        # is a real, not theoretical, risk).
+        self._auto_recall_cache = None
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         if self._repl is not None:
@@ -841,6 +928,7 @@ class RLMContextEngine(ContextEngine):
         self._persisted_count = 0
         self._resume_verified = True  # count is 0, nothing to verify
         self._next_turn_id = 0
+        self._auto_recall_cache = None
         if self._repl is not None:
             self._repl.close()
             self._repl = None

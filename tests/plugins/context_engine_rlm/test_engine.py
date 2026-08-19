@@ -1108,7 +1108,10 @@ def test_select_context_auto_recall_marker_never_has_system_role(tmp_path):
     construction site, must be covered independently of the plain-marker
     path above.
     """
-    engine = _make_engine(tmp_path)
+    # auto_recall defaults off (round 13) -- must enable it explicitly to
+    # actually exercise the recall-marker construction site this test is
+    # named for, not just the plain-marker path already covered above.
+    engine = _make_engine(tmp_path, auto_recall=True)
     engine.on_session_start("s1")
     engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
 
@@ -1179,3 +1182,174 @@ def test_enforce_system_message_position_does_not_mutate_original_dict(tmp_path)
 
     assert fixed[1]["role"] == "user"
     assert offender == original, "the original message dict must be untouched"
+
+
+# ---------------------------------------------------------------------------
+# Round-13: auto_recall defaults off (round-1's "forced recovery" case was
+# strong when rlm_repl's voluntary path was unreliable -- H1's timeout bug
+# and repl.py's context-goes-stale-after-first-call bug, both fixed since).
+# Stays available, opt-in, and memoized per-turn: select_context() runs
+# once per provider request (M4's own premise) with the SAME
+# incoming_message all turn, so an unmemoized auto-recall paid for the
+# same search + digest sub-call once per request.
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+def _fake_llm_response(content):
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def _seed_recall_match(engine, session_id, keyword):
+    # Large enough (several rows, well past auto_recall_digest_threshold_tokens
+    # default 400) to force the actual digest sub-call, not the inline-raw
+    # short-circuit.
+    body = f"{keyword} filler word " * 40
+    rows = [{"role": "user", "content": f"{keyword} archived detail {i}: {body}"} for i in range(4)]
+    engine._store.append_messages(session_id, 1, rows)
+
+
+def test_auto_recall_default_is_off(tmp_path):
+    engine = _make_engine(tmp_path)
+    assert engine._auto_recall is False
+
+
+def test_auto_recall_can_still_be_enabled_explicitly(tmp_path):
+    engine = _make_engine(tmp_path, auto_recall=True)
+    assert engine._auto_recall is True
+
+
+def test_auto_recall_digest_memoized_within_one_turn(tmp_path):
+    """N requests within one turn (same incoming_message) must cost
+    exactly one digest sub-call, not N -- the actual production bug: a
+    10-tool-call turn was paying for up to 10-11 identical blocking
+    call_llm() calls on the request path.
+    """
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine._archive_new(convo, turn_id=1)
+    _seed_recall_match(engine, "s1", "xylophone")
+    incoming = {"role": "user", "content": "tell me about the xylophone marmalade situation"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        for _ in range(5):
+            selected = engine.select_context(
+                convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072
+            )
+            assert selected is not None
+        assert mocked.call_count == 1, "5 requests in one turn must cost exactly 1 digest call"
+
+
+def test_auto_recall_cache_cleared_by_on_turn_complete(tmp_path):
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine._archive_new(convo, turn_id=1)
+    _seed_recall_match(engine, "s1", "xylophone")
+    incoming = {"role": "user", "content": "tell me about the xylophone marmalade situation"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 1
+
+        engine.on_turn_complete(convo, turn_id=1)
+
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 2, (
+            "next turn (even with the same question text) must recompute, "
+            "not reuse the prior turn's cached answer"
+        )
+
+
+def test_auto_recall_cache_not_served_to_a_different_question_same_turn(tmp_path):
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine._archive_new(convo, turn_id=1)
+    _seed_recall_match(engine, "s1", "xylophone")
+    _seed_recall_match(engine, "s1", "marmalade")
+
+    q1 = {"role": "user", "content": "tell me about the xylophone situation please"}
+    q2 = {"role": "user", "content": "tell me about the marmalade situation please"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        engine.select_context(convo, conversation_messages=convo, incoming_message=q1, budget_tokens=131072)
+        engine.select_context(convo, conversation_messages=convo, incoming_message=q2, budget_tokens=131072)
+        assert mocked.call_count == 2, (
+            "a different question within the same turn must not be served "
+            "the first question's cached answer"
+        )
+
+
+def test_auto_recall_negative_result_cached_too(tmp_path):
+    """The common outcome ('nothing relevant') must not re-run the search
+    every request either -- not just the (more expensive) digest.
+    """
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(60)
+    engine._archive_new(convo, turn_id=1)
+    incoming = {"role": "user", "content": "something entirely unrelated and unmatched"}
+
+    with mock.patch.object(engine._store, "search_any", wraps=engine._store.search_any) as spy:
+        for _ in range(4):
+            selected = engine.select_context(
+                convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072
+            )
+            assert selected is not None
+        assert spy.call_count == 1, "a cached negative must not re-run search_any on every request"
+
+
+def test_auto_recall_cache_does_not_leak_across_sessions(tmp_path):
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    convo = _convo(60)
+    engine._archive_new(convo, turn_id=1)
+    _seed_recall_match(engine, "s1", "xylophone")
+    incoming = {"role": "user", "content": "tell me about the xylophone situation please"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 1
+
+        # Same engine instance, new session -- reused across /new, not
+        # reconstructed (see on_session_start's own docstring).
+        engine.on_session_start("s2")
+        engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+        engine._archive_new(convo, turn_id=1)
+        _seed_recall_match(engine, "s2", "xylophone")
+
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 2, (
+            "a new session must not inherit the previous session's cached answer, "
+            "even for byte-identical question text"
+        )

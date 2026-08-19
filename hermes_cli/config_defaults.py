@@ -1870,15 +1870,26 @@ DEFAULT_CONFIG = {
         # vs. something else). "" = hermes' `delegation.api_mode` if
         # repl_query_model came from there, else root's api_mode.
         "repl_query_api_mode": "",
-        # Auto-recall: forced (not voluntary) recovery. Every turn past the
-        # drop threshold, a cheap keyword check against the incoming user
-        # message decides whether dropped history plausibly matters here --
-        # if so, a digested-and-capped snippet is injected into the request
-        # directly, with no dependence on the model noticing the drop
-        # marker or choosing to call rlm_repl. Set false to fall back to
-        # voluntary-only recovery (rlm_repl, called at the model's own
-        # discretion).
-        "auto_recall": True,
+        # Auto-recall: off by default (round 13). When enabled, every turn
+        # past the drop threshold, a cheap keyword check against the
+        # incoming user message decides whether dropped history plausibly
+        # matters here -- if so, a digested-and-capped snippet is injected
+        # into the request directly, forced (not voluntary) recovery, no
+        # dependence on the model noticing the drop marker or choosing to
+        # call rlm_repl itself.
+        #
+        # Off by default because the voluntary path (rlm_repl, at the
+        # model's own discretion) is now reliable -- it wasn't when this
+        # defaulted to true: a timeout misconfiguration could kill the
+        # REPL before a real recursive call returned, and the REPL's
+        # context variable went stale after the first call, both fixed
+        # since. With voluntary recovery actually working, paying a
+        # blocking digestion sub-call on the request path (see engine.py's
+        # measured per-turn cost) to pre-empt the model asking no longer
+        # earns its keep on every qualifying turn. Set true to opt back in
+        # -- still fully supported, and memoized per-turn (round 13) so
+        # enabling it doesn't cost N identical digests within one turn.
+        "auto_recall": False,
         # Words shorter than this are ignored when extracting keywords from
         # the incoming message for the relevance check.
         "auto_recall_min_keyword_len": 4,
