@@ -1818,19 +1818,34 @@ DEFAULT_CONFIG = {
         "db_path": "",
         # rlm_repl: a persistent Python REPL subprocess, one per session,
         # exposing history()/rlm_query() -- see plugins/context_engine/rlm/
-        # repl.py for the mechanism. Per-call wall-clock timeout; a call
-        # that exceeds it kills and restarts the REPL (session state lost,
-        # but the turn doesn't hang forever).
-        "repl_timeout_seconds": 15.0,
+        # repl.py for the mechanism. Per-call wall-clock timeout for the
+        # WHOLE exec() call; a call that exceeds it kills and restarts the
+        # REPL (session state lost, but the turn doesn't hang forever).
+        # MUST stay greater than repl_query_timeout_seconds below -- a code
+        # block that calls rlm_query() waits up to that long internally, and
+        # if this timeout were shorter it would kill the REPL out from under
+        # its own in-flight sub-call, destroying all state (the engine
+        # self-heals a misconfigured value here, but don't rely on that).
+        "repl_timeout_seconds": 90.0,
+        # rlm_query()'s own HTTP timeout, inside the REPL child.
+        "repl_query_timeout_seconds": 60.0,
         # Hard cap on one rlm_repl call's captured stdout, regardless of
         # whether the model remembered to digest a large result itself via
         # rlm_query() first -- this is what keeps root's context protected
         # even when the model doesn't cooperate.
         "repl_max_output_chars": 8000,
         # Model rlm_query() (inside the REPL) recurses against. "" = reuse
-        # the root model (same one active via model.default / the
-        # session's current model).
+        # hermes' own `delegation.model` config (cheaper-model-for-sub-work,
+        # already configured for exactly this purpose) if set, else the
+        # root model. Mirrors the paper's cost-parity setup (expensive root,
+        # cheap recursive child) instead of paying root-model price on
+        # every recursive call.
         "repl_query_model": "",
+        # base_url paired with repl_query_model when it names a delegation
+        # override -- a different model can mean a different endpoint
+        # entirely. "" = hermes' `delegation.base_url` if repl_query_model
+        # came from there, else the root model's base_url.
+        "repl_query_base_url": "",
         # Auto-recall: forced (not voluntary) recovery. Every turn past the
         # drop threshold, a cheap keyword check against the incoming user
         # message decides whether dropped history plausibly matters here --

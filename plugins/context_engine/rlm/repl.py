@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -38,13 +39,19 @@ logger = logging.getLogger(__name__)
 # a process boundary, not in-process exec — see the conversation that led
 # here for why that boundary matters).
 _BOOTSTRAP_TEMPLATE = '''
-import sys, io, json, contextlib, traceback, sqlite3, urllib.request
+import sys, os, io, json, contextlib, traceback, sqlite3, urllib.request
 
 DB_PATH = {db_path!r}
 SESSION_ID = {session_id!r}
 BASE_URL = {base_url!r}
 MODEL = {model!r}
-API_KEY = {api_key!r}
+API_MODE = {api_mode!r}
+QUERY_TIMEOUT = {query_timeout!r}
+# API key deliberately NOT interpolated into this script -- the script
+# text becomes this process' argv (visible to any local user via `ps
+# auxww`). Passed via env instead, which /proc/<pid>/environ still shows
+# to the same user but not to `ps`, the far more common exposure vector.
+API_KEY = os.environ.get("RLM_API_KEY", "")
 
 _ns = {{}}
 
@@ -69,7 +76,21 @@ def rlm_query(prompt, system="You are a focused sub-agent. Answer concisely.", m
     """Recursive call: ask the language model itself something, e.g. to
     digest a large chunk of history before you print it. This is the
     actual recursion in Recursive Language Models -- a language model
-    call made from inside code the root model wrote."""
+    call made from inside code the root model wrote.
+
+    Only chat_completions is implemented. Anthropic-native / Responses-API
+    style api_mode configs would need a different endpoint, payload shape,
+    and response parse -- rather than silently sending an OpenAI-shaped
+    request to an endpoint that doesn't speak it (wrong answers, or a
+    confusing error far from the actual cause), this fails loudly and
+    names exactly what's unsupported.
+    """
+    if API_MODE and API_MODE != "chat_completions":
+        raise NotImplementedError(
+            f"rlm_query() only supports api_mode='chat_completions', "
+            f"this session is configured with api_mode={{API_MODE!r}}. "
+            "Not implemented yet -- see plugins/context_engine/rlm/repl.py."
+        )
     body = json.dumps({{
         "model": MODEL,
         "messages": [
@@ -84,7 +105,7 @@ def rlm_query(prompt, system="You are a focused sub-agent. Answer concisely.", m
         headers["Authorization"] = "Bearer " + API_KEY
     url = BASE_URL.rstrip("/") + "/chat/completions"
     req = urllib.request.Request(url, data=body, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=QUERY_TIMEOUT) as resp:
         data = json.loads(resp.read())
     return data["choices"][0]["message"]["content"]
 
@@ -100,8 +121,20 @@ _ns["sqlite3"] = sqlite3
 # loaded (e.g. to pick up messages archived after this snapshot); `context`
 # here is the actual paper mechanism -- a real Python list, sliced/
 # filtered/searched with real Python, no query language needed.
-context = history(limit=5000)
+#
+# Chronological (oldest first) -- history()'s default order_by='id DESC'
+# is right for "most recent N", wrong for a context snapshot: the paper's
+# context is read start-to-end, and reversing it silently would make any
+# code assuming order (e.g. "the first message is the earliest") wrong
+# without any signal that something's off. context_total/context_truncated
+# make the 5000-row cap visible instead of silent -- a model reasonably
+# assumes "context" means "everything" unless told otherwise.
+context_total = len(history(limit=1_000_000))
+context = history(limit=5000, order_by="id ASC")
+context_truncated = context_total > len(context)
 _ns["context"] = context
+_ns["context_total"] = context_total
+_ns["context_truncated"] = context_truncated
 
 for line in sys.stdin:
     line = line.strip()
@@ -135,7 +168,9 @@ class PersistentREPL:
         base_url: str,
         model: str,
         api_key: str = "",
-        timeout: float = 15.0,
+        api_mode: str = "",
+        timeout: float = 90.0,
+        query_timeout: float = 60.0,
         max_output_chars: int = 8000,
     ):
         self.db_path = db_path
@@ -143,6 +178,24 @@ class PersistentREPL:
         self.base_url = base_url
         self.model = model
         self.api_key = api_key
+        self.api_mode = api_mode
+        self.query_timeout = query_timeout
+        # timeout bounds one whole exec() call; a code block can call
+        # rlm_query() (bounded by query_timeout) and do other work besides.
+        # If timeout <= query_timeout, a single sub-call alone can exceed
+        # the REPL's own wall-clock budget and get killed mid-flight,
+        # destroying all REPL state -- exactly the bug this class exists
+        # to not have (see the audit that found repl_timeout_seconds=15
+        # vs. a hardcoded 60s inner timeout). Self-heal rather than trust
+        # every future config value to keep this ordering by hand.
+        if timeout <= query_timeout:
+            logger.warning(
+                "RLM REPL: timeout (%.1fs) <= query_timeout (%.1fs) would let "
+                "a single rlm_query() call outlive and kill the REPL that "
+                "made it — raising timeout to query_timeout + 30s",
+                timeout, query_timeout,
+            )
+            timeout = query_timeout + 30.0
         self.timeout = timeout
         self.max_output_chars = max_output_chars
         self._proc: Optional[subprocess.Popen] = None
@@ -151,12 +204,18 @@ class PersistentREPL:
     def _bootstrap_script(self) -> str:
         return _BOOTSTRAP_TEMPLATE.format(
             db_path=self.db_path, session_id=self.session_id,
-            base_url=self.base_url, model=self.model, api_key=self.api_key or "",
+            base_url=self.base_url, model=self.model,
+            api_mode=self.api_mode or "", query_timeout=self.query_timeout,
         )
 
     def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
+        # API key via env, not the -c script argv (which `ps auxww` shows
+        # to any local user) -- see the module docstring note on RLM_API_KEY.
+        child_env = dict(os.environ)
+        if self.api_key:
+            child_env["RLM_API_KEY"] = self.api_key
         self._proc = subprocess.Popen(
             [sys.executable, "-u", "-c", self._bootstrap_script()],
             stdin=subprocess.PIPE,
@@ -164,6 +223,7 @@ class PersistentREPL:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            env=child_env,
         )
 
     def exec(self, code: str) -> Dict[str, Any]:

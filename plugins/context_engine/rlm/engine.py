@@ -111,16 +111,27 @@ RLM_REPL_SCHEMA = {
 
 class RLMContextEngine(ContextEngine):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        cfg = (config if config is not None else self._load_config()).get("rlm", {}) or {}
+        full_cfg = config if config is not None else self._load_config()
+        cfg = full_cfg.get("rlm", {}) or {}
+        _delegation_cfg = full_cfg.get("delegation", {}) or {}
         self.protect_first_n: int = int(cfg.get("protect_first_n", _DEFAULT_PROTECT_FIRST_N))
         self.protect_last_n: int = int(cfg.get("protect_last_n", _DEFAULT_PROTECT_LAST_N))
         self._tail_token_fraction: float = float(
             cfg.get("tail_token_budget_fraction", _DEFAULT_TAIL_TOKEN_BUDGET_FRACTION)
         )
         self._marker_role: str = cfg.get("marker_role", "system")
-        self._repl_timeout: float = float(cfg.get("repl_timeout_seconds", 15.0))
+        self._repl_timeout: float = float(cfg.get("repl_timeout_seconds", 90.0))
+        self._repl_query_timeout: float = float(cfg.get("repl_query_timeout_seconds", 60.0))
         self._repl_max_output_chars: int = int(cfg.get("repl_max_output_chars", 8000))
-        self._repl_query_model: str = cfg.get("repl_query_model", "")  # "" = reuse root's model
+        # Default the recursive sub-call to hermes' own delegation model —
+        # config.yaml already has a `delegation:` block precisely for
+        # "cheaper model for delegated sub-work" (mirrors the paper's cost-
+        # parity setup: expensive root, cheap child). Reusing it beats
+        # defaulting to the root model, which was the audit-flagged bug:
+        # every recursive call cost the same as a root call, for no reason.
+        # Explicit rlm.repl_query_model still overrides both.
+        self._repl_query_model: str = cfg.get("repl_query_model") or _delegation_cfg.get("model", "")
+        self._repl_query_base_url: str = cfg.get("repl_query_base_url") or _delegation_cfg.get("base_url", "")
         # Auto-recall: forced (not voluntary) recovery. Every turn past the
         # drop threshold, select_context() itself checks whether the
         # incoming user message plausibly needs dropped history (cheap
@@ -136,7 +147,7 @@ class RLMContextEngine(ContextEngine):
         self._auto_recall_min_keywords: int = int(cfg.get("auto_recall_min_keywords", 2))
         self._auto_recall_digest_threshold_tokens: int = int(cfg.get("auto_recall_digest_threshold_tokens", 400))
         self._auto_recall_max_tokens: int = int(cfg.get("auto_recall_max_tokens", 300))
-        db_path = cfg.get("db_path") or self._default_db_path()
+        self._db_path: str = cfg.get("db_path") or self._default_db_path()
 
         self._session_id: str = "unknown"
         self._persisted_count: int = 0  # how many of the live `messages` we've archived
@@ -145,11 +156,19 @@ class RLMContextEngine(ContextEngine):
         self._runtime: Dict[str, str] = {}  # captured in update_model(), used to spawn the REPL
         self._repl: Optional[PersistentREPL] = None
 
+        self._open_store()
+
+    def _open_store(self) -> None:
+        """(Re)open the archive. Safe to call when already open (no-op)."""
+        if self._store is not None:
+            return
         try:
-            self._store = RLMStore(db_path)
+            self._store = RLMStore(self._db_path)
+            self._store_error = None
         except Exception as e:
+            self._store = None
             self._store_error = str(e)
-            logger.exception("RLM: failed to open store at %s — running as passthrough", db_path)
+            logger.exception("RLM: failed to open store at %s — running as passthrough", self._db_path)
 
     # -- setup helpers ---------------------------------------------------
 
@@ -200,8 +219,20 @@ class RLMContextEngine(ContextEngine):
         )
         self._runtime = {
             "model": self._repl_query_model or model,
-            "base_url": base_url or "",
+            # If a delegation/override model is in play, its base_url must
+            # travel with it — a different model can mean a different
+            # endpoint entirely, not just a cheaper name on the same one.
+            "base_url": (self._repl_query_model and self._repl_query_base_url) or base_url or "",
+            # NOTE (known limitation, not silently swept under the rug):
+            # api_key still follows ROOT's resolved key, not a separately-
+            # resolved delegation key. hermes' real API-key resolution
+            # (auth.json / provider config / env) is core machinery this
+            # plugin doesn't have a clean way to invoke standalone. Correct
+            # on this box (local server, no key needed either way); would
+            # be wrong if delegation pointed at a provider needing its own
+            # key different from root's.
             "api_key": api_key or "",
+            "api_mode": api_mode or "",
         }
         # A running REPL was bootstrapped with the OLD model/base_url —
         # restart it so a mid-session /model switch takes effect. Losing
@@ -246,6 +277,18 @@ class RLMContextEngine(ContextEngine):
 
         # Archive first so the safety net never loses data either — it only
         # ever drops from the LIVE prompt, exactly like the normal path.
+        # Unlike select_context() (optional, safe to no-op), compress()
+        # exists precisely because the request must shrink or the provider
+        # 400s on overflow — refusing to drop here would trade silent data
+        # loss for a guaranteed hard failure, which is worse. If the store
+        # is unavailable, dropping still has to happen; make that loud.
+        if not self._store:
+            logger.error(
+                "RLM: compress() must drop content but the archive store is "
+                "unavailable (%s) — this drop is UNRECOVERABLE, not the "
+                "normal archived-and-recoverable path.",
+                self._store_error or "not open",
+            )
         self._archive_new(messages)
 
         system = messages[:1] if messages and messages[0].get("role") == "system" else []
@@ -267,6 +310,13 @@ class RLMContextEngine(ContextEngine):
         incoming_message: Dict[str, Any] = None,
         budget_tokens: int = 0,
     ) -> Optional[List[Dict[str, Any]]]:
+        if not self._store:
+            # Never drop content we can't archive. Without an open store,
+            # "drop the middle" isn't a bounded-context trick, it's data
+            # loss with no recovery path (rlm_repl needs the store too) —
+            # fail open to the full transcript instead. This must come
+            # before anything else in this method.
+            return None
         convo = conversation_messages or []
         non_system = [m for m in convo if m.get("role") != "system"]
         if len(non_system) <= self.protect_first_n + self.protect_last_n:
@@ -370,6 +420,7 @@ class RLMContextEngine(ContextEngine):
                 model=self._runtime["model"],
                 base_url=self._runtime.get("base_url") or None,
                 api_key=self._runtime.get("api_key") or None,
+                api_mode=self._runtime.get("api_mode") or None,
             )
         except Exception:
             logger.exception("RLM: auto-recall digestion sub-call raised")
@@ -475,6 +526,16 @@ class RLMContextEngine(ContextEngine):
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or "unknown"
+        # Self-healing: hermes-agent reuses ONE engine instance across /new
+        # (cli.py calls on_session_end at that boundary, then rebinds this
+        # same instance to the new session — it does not construct a fresh
+        # engine). on_session_end() below closes the store, so without this
+        # reopen, every session after the first /new would run with
+        # self._store permanently None: select_context() would (if C1
+        # weren't also fixed) drop history with nothing archived, silently
+        # and permanently. Also retries a store that failed to open at
+        # construction time (transient FS issue, etc).
+        self._open_store()
         if self._store:
             try:
                 # Resume-safe: if this session already has archived rows
@@ -496,6 +557,12 @@ class RLMContextEngine(ContextEngine):
         try:
             self._archive_new(messages)  # catch anything since the last on_turn_complete
         finally:
+            # Close but do NOT null self._store's slot permanently here —
+            # on_session_start() reopens it. Nulling only the reference (not
+            # a flag) is fine: is_available()/every store check treats "is
+            # it currently open" via self._store, and the next
+            # on_session_start() unconditionally calls _open_store() before
+            # anything else touches it.
             self._store.close()
             self._store = None
 
@@ -524,7 +591,9 @@ class RLMContextEngine(ContextEngine):
             base_url=self._runtime.get("base_url", ""),
             model=self._runtime.get("model", ""),
             api_key=self._runtime.get("api_key", ""),
+            api_mode=self._runtime.get("api_mode", ""),
             timeout=self._repl_timeout,
+            query_timeout=self._repl_query_timeout,
             max_output_chars=self._repl_max_output_chars,
         )
         return self._repl
