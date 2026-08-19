@@ -47,6 +47,7 @@ BASE_URL = {base_url!r}
 MODEL = {model!r}
 API_MODE = {api_mode!r}
 QUERY_TIMEOUT = {query_timeout!r}
+MAX_QUERY_CALLS = {max_query_calls!r}
 # API key deliberately NOT interpolated into this script -- the script
 # text becomes this process' argv (visible to any local user via `ps
 # auxww`). Passed via env instead, which /proc/<pid>/environ still shows
@@ -86,6 +87,15 @@ def history(where="1=1", limit=100, order_by="id DESC"):
         conn.close()
     return [dict(zip(("turn_id", "role", "content", "ts"), r)) for r in rows]
 
+# L3 fix: nothing previously bounded how many times one exec() call could
+# recurse -- a runaway loop calling rlm_query() was limited only by the
+# wall-clock timeout (which then kills the whole REPL, destroying state,
+# as its own failure mode), and root had no visibility into what a call
+# actually spent even when it stayed within budget. Reset at the top of
+# every exec() (see the main loop below), so it's a per-call budget, not
+# cumulative across the session.
+_query_spend = {{"count": 0, "chars_in": 0, "chars_out": 0}}
+
 def rlm_query(prompt, system="You are a focused sub-agent. Answer concisely.", max_tokens=500):
     """Recursive call: ask the language model itself something, e.g. to
     digest a large chunk of history before you print it. This is the
@@ -98,13 +108,27 @@ def rlm_query(prompt, system="You are a focused sub-agent. Answer concisely.", m
     request to an endpoint that doesn't speak it (wrong answers, or a
     confusing error far from the actual cause), this fails loudly and
     names exactly what's unsupported.
+
+    Bounded to MAX_QUERY_CALLS per rlm_repl call (see the tool description
+    for the current limit) -- raises, rather than silently truncating a
+    runaway recursive loop, once exceeded.
     """
+    if _query_spend["count"] >= MAX_QUERY_CALLS:
+        raise RuntimeError(
+            f"rlm_query() call limit reached ({{MAX_QUERY_CALLS}} per rlm_repl "
+            "call). This is a per-call budget, not cumulative -- if the task "
+            "genuinely needs more recursive calls than this, split it across "
+            "multiple rlm_repl calls (state persists between them) rather "
+            "than looping past the limit in one."
+        )
     if API_MODE and API_MODE != "chat_completions":
         raise NotImplementedError(
             f"rlm_query() only supports api_mode='chat_completions', "
             f"this session is configured with api_mode={{API_MODE!r}}. "
             "Not implemented yet -- see plugins/context_engine/rlm/repl.py."
         )
+    _query_spend["count"] += 1
+    _query_spend["chars_in"] += len(prompt) + len(system)
     body = json.dumps({{
         "model": MODEL,
         "messages": [
@@ -121,7 +145,13 @@ def rlm_query(prompt, system="You are a focused sub-agent. Answer concisely.", m
     req = urllib.request.Request(url, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=QUERY_TIMEOUT) as resp:
         data = json.loads(resp.read())
-    return data["choices"][0]["message"]["content"]
+    answer = data["choices"][0]["message"]["content"]
+    # Local models can return None content for very short max_tokens
+    # (reasoning-only response, nothing in the visible field) -- guard
+    # rather than crash the spend accounting on it. Return value itself is
+    # unchanged (still None in that case), matching prior behavior.
+    _query_spend["chars_out"] += len(answer or "")
+    return answer
 
 _ns["history"] = history
 _ns["rlm_query"] = rlm_query
@@ -238,6 +268,9 @@ for line in sys.stdin:
     _ns.update(_BASE_BINDINGS)  # restore anything the model clobbered last call
     _refresh_context()
     _final_holder[0] = None
+    _query_spend["count"] = 0
+    _query_spend["chars_in"] = 0
+    _query_spend["chars_out"] = 0
     buf = io.StringIO()
     result = {{"stdout": "", "error": None}}
     try:
@@ -248,6 +281,11 @@ for line in sys.stdin:
 
     if _final_holder[0] is not None:
         result["final"] = _final_holder[0]
+
+    # L3 fix: always present (even all-zero), not just on overrun -- root
+    # can otherwise never see what a call spent recursing, only find out
+    # it went over budget after the fact via the error above.
+    result["query_spend"] = dict(_query_spend)
 
     _code_log.append((_call_index, code))
     del _code_log[:-_CODE_LOG_MAX]
@@ -291,6 +329,7 @@ class PersistentREPL:
         query_timeout: float = 60.0,
         max_output_chars: int = 8000,
         final_max_chars: int = 20000,
+        max_query_calls: int = 20,
     ):
         self.db_path = db_path
         self.session_id = session_id
@@ -324,6 +363,11 @@ class PersistentREPL:
         # uncapped path here would undo the entire guarantee this engine
         # exists to provide).
         self.final_max_chars = final_max_chars
+        # L3 fix: bounds how many times one exec() call may recurse via
+        # rlm_query() -- previously unbounded except by the wall-clock
+        # timeout, whose failure mode (kill the REPL, lose all state) is
+        # worse than a clear in-band error naming the limit.
+        self.max_query_calls = max_query_calls
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
 
@@ -332,6 +376,7 @@ class PersistentREPL:
             db_path=self.db_path, session_id=self.session_id,
             base_url=self.base_url, model=self.model,
             api_mode=self.api_mode or "", query_timeout=self.query_timeout,
+            max_query_calls=self.max_query_calls,
         )
 
     def _ensure_started(self) -> None:

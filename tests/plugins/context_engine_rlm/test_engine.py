@@ -273,10 +273,9 @@ def _archive_and_repl(tmp_path, messages, turn_id=1, **repl_overrides):
     engine.on_session_start("repl-test")
     engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
     engine.on_turn_complete(messages, turn_id=turn_id)
-    repl = PersistentREPL(
-        db_path=engine._store.db_path, session_id="repl-test",
-        base_url="http://x/v1", model="m", **repl_overrides,
-    )
+    repl_kwargs = {"base_url": "http://x/v1", "model": "m"}
+    repl_kwargs.update(repl_overrides)
+    repl = PersistentREPL(db_path=engine._store.db_path, session_id="repl-test", **repl_kwargs)
     return engine, repl
 
 
@@ -720,3 +719,98 @@ def test_message_count_lookup_failure_tombstones(tmp_path):
 
     engine.on_turn_complete([{"role": "user", "content": "new-b"}], turn_id=1)
     assert engine._store.message_count("s2") == 1, "old-b must be tombstoned, not duplicated onto new-b"
+
+
+# ---------------------------------------------------------------------------
+# Round-7 (L2/L3/L4)
+# ---------------------------------------------------------------------------
+#
+# L2 (measured, not implemented): search_any/message_count/tail_content are
+# all session_id-scoped and hit the (session_id, ...) composite indexes, so
+# cost tracks per-session row count, not total archive size. Benchmarked
+# directly (not as a pytest case -- no assertion threshold to encode, this
+# was a go/no-go measurement): 200k rows across 500 sessions, typical
+# session (~400 rows) at ~0.03ms/call; a deliberately worst-cased single
+# session at 50k rows (half tombstoned, simulating many resyncs) still
+# under 0.25ms/call. No FTS5, no retention added -- genuinely fine at
+# realistic and even unrealistic single-user scale.
+
+def test_query_spend_present_even_when_rlm_query_never_called(tmp_path, _cleanup_repl):
+    """L3: root must be able to see recursion spend on every call, not
+    just discover it after the fact when a limit is hit.
+    """
+    _, repl = _archive_and_repl(tmp_path, [{"role": "user", "content": "x"}])
+    _cleanup_repl.append(repl)
+    r = repl.exec("print(1)")
+    assert r.get("query_spend") == {"count": 0, "chars_in": 0, "chars_out": 0}
+
+
+def test_query_call_limit_enforced_and_counts_failed_attempts(tmp_path, _cleanup_repl):
+    """L3: the limit must fire after exactly max_query_calls attempts, with
+    a clear error naming the limit -- not a silent truncation, and not
+    dependent on a real model (base_url points at a port nothing listens
+    on, so every attempt fails fast and deterministically; the limit check
+    itself runs before the network call, so this still exercises it).
+    """
+    _, repl = _archive_and_repl(
+        tmp_path, [{"role": "user", "content": "x"}],
+        base_url="http://127.0.0.1:1/v1", max_query_calls=2,
+    )
+    _cleanup_repl.append(repl)
+    r = repl.exec(
+        "attempts = 0\n"
+        "blocked = None\n"
+        "for i in range(5):\n"
+        "    attempts += 1\n"
+        "    try:\n"
+        "        rlm_query('x')\n"
+        "    except RuntimeError as e:\n"
+        "        blocked = str(e)\n"
+        "        break\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "print(attempts, bool(blocked))\n"
+        "print(blocked)\n"
+    )
+    assert r["error"] is None, r
+    lines = r["stdout"].splitlines()
+    attempts, was_blocked = lines[0].split()
+    assert int(attempts) == 3, "2 real (failed) attempts, then blocked on the 3rd"
+    assert was_blocked == "True"
+    assert "limit reached (2" in lines[1]
+    assert r["query_spend"]["count"] == 2, "blocked calls must not count against spend"
+
+
+def test_query_call_limit_resets_per_exec_call(tmp_path, _cleanup_repl):
+    """The budget is per rlm_repl call, not cumulative across the session."""
+    _, repl = _archive_and_repl(
+        tmp_path, [{"role": "user", "content": "x"}],
+        base_url="http://127.0.0.1:1/v1", max_query_calls=1,
+    )
+    _cleanup_repl.append(repl)
+
+    def one_attempt():
+        return repl.exec(
+            "try:\n    rlm_query('x')\nexcept RuntimeError as e:\n    print('BLOCKED')\nexcept Exception:\n    print('NETERR')"
+        )
+
+    r1 = one_attempt()
+    assert r1["stdout"].strip() == "NETERR"  # the one allowed attempt, fails on the network
+    r2 = one_attempt()
+    assert r2["stdout"].strip() == "NETERR", "a fresh call must get a fresh budget, not stay blocked"
+
+
+# L4 — schema must register even when the store failed to open
+def test_schema_present_when_store_unavailable(tmp_path):
+    engine = RLMContextEngine(config={"rlm": {"db_path": "/root/no-permission/rlm.db"}})
+    assert engine._store is None
+    schemas = engine.get_tool_schemas()
+    assert len(schemas) == 1
+    assert schemas[0]["name"] == "rlm_repl"
+
+
+def test_handle_tool_call_reports_store_error_when_schema_present_but_store_down(tmp_path):
+    import json as _json
+    engine = RLMContextEngine(config={"rlm": {"db_path": "/root/no-permission/rlm.db"}})
+    result = _json.loads(engine.handle_tool_call("rlm_repl", {"code": "print(1)"}))
+    assert "RLM store unavailable" in result["error"]

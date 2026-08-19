@@ -103,7 +103,13 @@ RLM_REPL_SCHEMA = {
         "- rlm_query(prompt, system=..., max_tokens=500) -> str. Calls "
         "the language model itself — use this to digest/summarize a "
         "large result BEFORE printing it, so your own output (which is "
-        "capped) stays useful instead of getting truncated.\n"
+        "capped) stays useful instead of getting truncated. Limited to "
+        "20 calls per rlm_repl call (a fresh budget each time you call "
+        "this tool) — raises a clear error if you exceed it rather than "
+        "truncating silently; split genuinely larger recursive work "
+        "across multiple rlm_repl calls instead of looping past it. "
+        "Every response includes a query_spend field (count, chars_in, "
+        "chars_out) so you can see what a call spent even under budget.\n"
         "- final(text) -> use this for your deliberate, complete answer "
         "instead of print() when it's long-form — it's capped higher than "
         "routine print() output (which is capped more aggressively since "
@@ -156,6 +162,11 @@ class RLMContextEngine(ContextEngine):
         # squeezed through the same aggressive cap as incidental print()
         # output, but still capped, never unbounded.
         self._repl_final_max_chars: int = int(cfg.get("repl_final_max_chars", 20000))
+        # L3 fix: bounds one exec() call's rlm_query() recursion -- fails
+        # loud with a clear limit-naming error instead of the only prior
+        # bound (wall-clock timeout) which kills the whole REPL and its
+        # state as its failure mode.
+        self._repl_max_query_calls: int = int(cfg.get("repl_max_query_calls", 20))
         # Default the recursive sub-call to hermes' own delegation model —
         # config.yaml already has a `delegation:` block precisely for
         # "cheaper model for delegated sub-work" (mirrors the paper's cost-
@@ -753,8 +764,14 @@ class RLMContextEngine(ContextEngine):
     # -- tools: the persistent REPL -------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if not self._store:
-            return []
+        # L4 fix: agent_init.py reads this ONCE at agent construction. If
+        # the store wasn't open at that exact moment (a transient FS
+        # error), gating this on self._store meant rlm_repl was never
+        # registered even after _open_store() later succeeded on the next
+        # on_session_start() -- yet the dropped-content marker still tells
+        # the model to call rlm_repl, pointing it at a tool that doesn't
+        # exist. Register unconditionally; handle_tool_call() below already
+        # reports a clean, specific error when the store really is down.
         return [RLM_REPL_SCHEMA]
 
     def _ensure_repl(self) -> Optional[PersistentREPL]:
@@ -773,6 +790,7 @@ class RLMContextEngine(ContextEngine):
             query_timeout=self._repl_query_timeout,
             max_output_chars=self._repl_max_output_chars,
             final_max_chars=self._repl_final_max_chars,
+            max_query_calls=self._repl_max_query_calls,
         )
         return self._repl
 

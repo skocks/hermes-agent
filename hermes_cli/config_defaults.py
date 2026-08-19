@@ -1840,6 +1840,12 @@ DEFAULT_CONFIG = {
         # unbounded (the entire point of this engine is protecting root's
         # context regardless of intent).
         "repl_final_max_chars": 20000,
+        # Cap on rlm_query() calls per rlm_repl exec() -- a fresh budget
+        # each time the tool is called, not cumulative across the session.
+        # Exceeding it raises a clear in-band error naming the limit
+        # instead of relying on the wall-clock timeout (which kills the
+        # whole REPL, losing all state, as its failure mode).
+        "repl_max_query_calls": 20,
         # Model rlm_query() (inside the REPL) recurses against. "" = reuse
         # hermes' own `delegation.model` config (cheaper-model-for-sub-work,
         # already configured for exactly this purpose) if set, else the
