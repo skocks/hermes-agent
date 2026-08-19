@@ -883,14 +883,32 @@ class RLMContextEngine(ContextEngine):
         devastating one on this hardware. The count was never something
         the model acted on -- it's not worth a cache break at any
         granularity, so it's gone, not bucketed further.
+
+        Round-17: reworded from informational to directive. Measured
+        against 5,458 real production turns: 97 carried this marker, 0
+        ever led to an rlm_repl call -- yet a manually-pointed real
+        session (same model, same tool list) used rlm_repl competently,
+        multi-call, self-refining, and got a correct, verbatim-recovered
+        answer the moment it was told to look. Not a capability gap, not
+        a tool-description gap -- a discovery gap: the old text
+        ("...Use rlm_repl ... if you need something from earlier") made
+        retrieval conditional on the model first judging, unprompted,
+        that it lacks something -- precisely the judgment it wasn't
+        making. The rewrite makes checking the default action instead of
+        a maybe: not being sure whether earlier context matters is itself
+        the trigger, not a reason to skip it. Kept short and still
+        constant text -- this sits on the same cache-sensitive prefix
+        round 15 stabilized, so its length matters as much as the old
+        bucketed count did.
         """
         return {
             "role": self._marker_role,
             "content": (
-                "[RLM: some earlier messages were omitted from this "
-                "context to keep it small — archived, not deleted. Use "
-                "rlm_repl (history()/rlm_query() are pre-loaded) if you "
-                "need something from earlier in this conversation.]"
+                "[RLM: earlier context was dropped here — archived, not "
+                "deleted. Call rlm_repl FIRST before answering anything "
+                "that might depend on it. Being unsure whether it matters "
+                "IS the reason to check — don't guess or claim you can't "
+                "recall without checking.]"
             ),
         }
 

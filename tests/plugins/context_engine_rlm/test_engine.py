@@ -1723,3 +1723,26 @@ def test_bound_tail_tokens_still_caps_an_oversized_slice(tmp_path):
     total_tokens = sum(estimate_tokens_rough(_content_as_text(m)) for m in capped)
     token_cap = int(1000 * engine._tail_token_fraction)
     assert total_tokens <= token_cap * 1.2  # slack: char-based token estimate, not exact
+
+
+# ---------------------------------------------------------------------------
+# Round-17: measured 5,458 real production turns -- 97 carried the drop
+# marker, 0 ever led to an rlm_repl call, despite a manually-pointed real
+# session proving the model uses the tool competently once told to. Not a
+# capability gap -- a discovery gap: the old marker made checking
+# conditional on the model noticing it lacked something. Reworded
+# directive; still constant text (round 15's cache-stability invariant).
+# ---------------------------------------------------------------------------
+
+def test_dropped_marker_is_directive_not_merely_informational(tmp_path):
+    engine = _make_engine(tmp_path)
+    marker = engine._dropped_marker()
+    content = marker["content"].lower()
+    assert "call rlm_repl" in content or "call rlm_repl first" in content, (
+        "must instruct the model to call the tool, not merely note that it exists"
+    )
+    assert "if you need" not in content, (
+        "must not make checking conditional on the model first judging it needs "
+        "something -- that judgment call is precisely what production measured "
+        "the model failing to make (97 marker-bearing turns, 0 rlm_repl calls)"
+    )
