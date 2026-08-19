@@ -112,6 +112,23 @@ class RLMStore:
             )
             return cur.fetchone()[0] or 0
 
+    def tail_content(self, session_id: str, n: int) -> List[str]:
+        """Content of the last n archived rows, oldest-first -- for M6's
+        resume-watermark verification: compare against the corresponding
+        tail of the live transcript to check message_count() (a raw row
+        total, inflatable by past duplication -- see _archive_new's
+        shrink-guard) actually still lines up with reality before trusting
+        it as the resume position.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT content FROM rlm_messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, max(0, int(n))),
+            )
+            rows = [r[0] for r in cur.fetchall()]
+        return list(reversed(rows))
+
     def close(self) -> None:
         with self._lock:
             try:

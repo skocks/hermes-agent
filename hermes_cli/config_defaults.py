@@ -1834,6 +1834,12 @@ DEFAULT_CONFIG = {
         # rlm_query() first -- this is what keeps root's context protected
         # even when the model doesn't cooperate.
         "repl_max_output_chars": 8000,
+        # Cap on final() specifically (see repl.py) -- higher than the
+        # routine stdout cap above since it's a deliberate, complete answer
+        # rather than incidental print() output, but still capped, never
+        # unbounded (the entire point of this engine is protecting root's
+        # context regardless of intent).
+        "repl_final_max_chars": 20000,
         # Model rlm_query() (inside the REPL) recurses against. "" = reuse
         # hermes' own `delegation.model` config (cheaper-model-for-sub-work,
         # already configured for exactly this purpose) if set, else the

@@ -62,7 +62,7 @@ from agent.context_engine import ContextEngine
 from agent.model_metadata import estimate_tokens_rough
 
 from .repl import PersistentREPL
-from .store import RLMStore
+from .store import RLMStore, _stringify as _store_stringify
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +104,12 @@ RLM_REPL_SCHEMA = {
         "the language model itself — use this to digest/summarize a "
         "large result BEFORE printing it, so your own output (which is "
         "capped) stays useful instead of getting truncated.\n"
+        "- final(text) -> use this for your deliberate, complete answer "
+        "instead of print() when it's long-form — it's capped higher than "
+        "routine print() output (which is capped more aggressively since "
+        "it's usually incidental). Still capped, not unlimited — for a "
+        "very long answer, summarize with rlm_query() rather than "
+        "assuming this is truly boundless.\n"
         "- reset() -> clears every variable you've set (keeping context/"
         "history/rlm_query/code_log/reset). Call this when starting an "
         "unrelated task so leftover variables from an earlier one (chunks, "
@@ -146,6 +152,11 @@ class RLMContextEngine(ContextEngine):
         self._repl_timeout: float = float(cfg.get("repl_timeout_seconds", 90.0))
         self._repl_query_timeout: float = float(cfg.get("repl_query_timeout_seconds", 60.0))
         self._repl_max_output_chars: int = int(cfg.get("repl_max_output_chars", 8000))
+        # M5 fix: final() (see repl.py) gets this higher cap instead of the
+        # routine one above -- a deliberate, complete answer shouldn't be
+        # squeezed through the same aggressive cap as incidental print()
+        # output, but still capped, never unbounded.
+        self._repl_final_max_chars: int = int(cfg.get("repl_final_max_chars", 20000))
         # Default the recursive sub-call to hermes' own delegation model —
         # config.yaml already has a `delegation:` block precisely for
         # "cheaper model for delegated sub-work" (mirrors the paper's cost-
@@ -190,6 +201,16 @@ class RLMContextEngine(ContextEngine):
         # wrong by more than one, and never a data-loss issue either way —
         # content is fully archived and searchable regardless of this tag.
         self._next_turn_id: int = 0
+        # M6 fix: message_count(session_id) (a raw row total) is what
+        # on_session_start uses to guess _persisted_count on resume -- but
+        # it's inflatable by the shrink-guard's own past resyncs (each one
+        # duplicates rows), so trusting it blindly can set _persisted_count
+        # HIGHER than the true overlap point, silently skipping archival of
+        # real content until the transcript organically grows past the
+        # inflated number. Verified content-for-content on the first
+        # _archive_new() call after a resume (the earliest point the live
+        # transcript is actually visible); until then, treated as unverified.
+        self._resume_verified: bool = True  # True until on_session_start sets it False
         self._store: Optional[RLMStore] = None
         self._store_error: Optional[str] = None
         self._runtime: Dict[str, str] = {}  # captured in update_model(), used to spawn the REPL
@@ -545,6 +566,8 @@ class RLMContextEngine(ContextEngine):
     def _archive_new(self, messages: List[Dict[str, Any]], turn_id: int = -1) -> None:
         if not self._store:
             return
+        if not self._resume_verified:
+            self._verify_resume_watermark(messages)
         if len(messages) < self._persisted_count:
             # The live transcript got shorter than what we've archived —
             # e.g. a /reset, a manual /compress, or a session we haven't
@@ -568,6 +591,48 @@ class RLMContextEngine(ContextEngine):
                 "RLM: failed to archive %d message(s) for session=%s",
                 len(new_messages), self._session_id,
             )
+
+    def _verify_resume_watermark(self, messages: List[Dict[str, Any]]) -> None:
+        """M6 fix: on_session_start()'s _persisted_count estimate comes
+        from message_count() (a raw row total), inflatable by the shrink-
+        guard's own past resyncs -- each duplicates rows, so the total can
+        end up HIGHER than the true overlap point between what's archived
+        and what's live. Trusting that blindly means messages[_persisted_
+        count:] silently skips real, never-archived content until the live
+        transcript organically grows past the inflated number.
+
+        Runs once, on the first _archive_new() call after a resume (the
+        earliest point the live transcript is actually visible to this
+        engine -- on_session_start() doesn't receive it). Compares the
+        stored content of the last few archived rows against the
+        corresponding tail of the live transcript; on any mismatch (or if
+        there isn't enough live transcript to check against), falls back
+        to the existing safe default -- full resync from 0 -- rather than
+        trusting an unverifiable number.
+        """
+        self._resume_verified = True  # only ever attempt this once per resume
+        check_n = min(5, self._persisted_count, len(messages))
+        if check_n <= 0:
+            if self._persisted_count > len(messages):
+                self._persisted_count = 0  # nothing to verify against; be safe
+            return
+        try:
+            archived_tail = self._store.tail_content(self._session_id, check_n)
+        except Exception:
+            logger.exception("RLM: resume watermark verification failed, resyncing from 0")
+            self._persisted_count = 0
+            return
+        live_tail = [
+            _store_stringify(m) for m in messages[self._persisted_count - check_n : self._persisted_count]
+        ]
+        if archived_tail != live_tail:
+            logger.warning(
+                "RLM: resume watermark for session=%s did not verify "
+                "(message_count=%d likely inflated by an earlier resync) "
+                "— resyncing from 0 instead of trusting it",
+                self._session_id, self._persisted_count,
+            )
+            self._persisted_count = 0
 
     def on_turn_complete(
         self,
@@ -603,13 +668,19 @@ class RLMContextEngine(ContextEngine):
             try:
                 # Resume-safe: if this session already has archived rows
                 # (process restart, gateway reconnect), don't re-persist
-                # what's already there on the next on_turn_complete().
+                # what's already there on the next on_turn_complete(). This
+                # is a provisional estimate -- _archive_new() verifies it
+                # content-for-content on first real use (M6 fix) rather
+                # than trusting it blindly for the rest of the session.
                 self._persisted_count = self._store.message_count(self._session_id)
+                self._resume_verified = self._persisted_count == 0  # nothing to verify against
             except Exception:
                 logger.exception("RLM: message_count lookup failed on session start")
                 self._persisted_count = 0
+                self._resume_verified = True
         else:
             self._persisted_count = 0
+            self._resume_verified = True
         self._next_turn_id = 0
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
@@ -633,6 +704,7 @@ class RLMContextEngine(ContextEngine):
     def on_session_reset(self) -> None:
         super().on_session_reset()
         self._persisted_count = 0
+        self._resume_verified = True  # count is 0, nothing to verify
         self._next_turn_id = 0
         if self._repl is not None:
             self._repl.close()
@@ -660,6 +732,7 @@ class RLMContextEngine(ContextEngine):
             timeout=self._repl_timeout,
             query_timeout=self._repl_query_timeout,
             max_output_chars=self._repl_max_output_chars,
+            final_max_chars=self._repl_final_max_chars,
         )
         return self._repl
 

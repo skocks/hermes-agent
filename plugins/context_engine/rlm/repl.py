@@ -126,6 +126,27 @@ _ns["history"] = history
 _ns["rlm_query"] = rlm_query
 _ns["sqlite3"] = sqlite3
 
+# M5 fix: the paper can return a REPL-constructed string directly as the
+# answer (FINAL_VAR), no cap. Every answer here otherwise has to squeeze
+# through the routine stdout cap (max_output_chars, ~8000 chars by
+# default) -- real capability loss for genuinely long-form output the
+# model deliberately constructed as ITS answer, as opposed to incidental
+# print() spam. final() gets a separate, higher cap (final_max_chars,
+# default higher than max_output_chars) instead of the general one -- but
+# still capped, never unbounded: an uncapped path here would undo the
+# entire guarantee this engine exists to provide, no matter how
+# deliberate the model's intent was.
+_final_holder = [None]
+
+def final(text):
+    """Mark `text` as your deliberate, complete answer -- returned under a
+    higher length cap than ordinary print() output (which is capped more
+    aggressively since it's usually incidental, not the actual answer).
+    Still capped, not unlimited -- for a very long answer, still summarize
+    with rlm_query() rather than assuming this is truly boundless."""
+    _final_holder[0] = str(text)
+    return text
+
 # THE part that makes this faithful to the paper rather than a query API
 # wearing a REPL costume: the paper binds the prompt/context as a plain
 # variable the model slices with ordinary Python (indexing, regex, list
@@ -185,7 +206,7 @@ def code_log(n=20):
 # restored before the NEXT call, so shadowing only ever lasts for the one
 # call that did it, never permanently.
 _BASE_BINDINGS = {{
-    "history": history, "rlm_query": rlm_query, "sqlite3": sqlite3,
+    "history": history, "rlm_query": rlm_query, "sqlite3": sqlite3, "final": final,
     "reset": None, "code_log": code_log,  # reset assigned just below (refers to itself)
 }}
 
@@ -215,6 +236,7 @@ for line in sys.stdin:
     _call_index += 1
     _ns.update(_BASE_BINDINGS)  # restore anything the model clobbered last call
     _refresh_context()
+    _final_holder[0] = None
     buf = io.StringIO()
     result = {{"stdout": "", "error": None}}
     try:
@@ -222,6 +244,9 @@ for line in sys.stdin:
             exec(compile(code, "<rlm_repl>", "exec"), _ns)
     except Exception:
         result["error"] = traceback.format_exc(limit=6)
+
+    if _final_holder[0] is not None:
+        result["final"] = _final_holder[0]
 
     _code_log.append((_call_index, code))
     del _code_log[:-_CODE_LOG_MAX]
@@ -264,6 +289,7 @@ class PersistentREPL:
         timeout: float = 90.0,
         query_timeout: float = 60.0,
         max_output_chars: int = 8000,
+        final_max_chars: int = 20000,
     ):
         self.db_path = db_path
         self.session_id = session_id
@@ -290,6 +316,13 @@ class PersistentREPL:
             timeout = query_timeout + 30.0
         self.timeout = timeout
         self.max_output_chars = max_output_chars
+        # M5 fix: final() gets a separate, higher cap than routine stdout --
+        # a deliberate, complete answer the model constructed shouldn't be
+        # squeezed through the same aggressive cap as incidental print()
+        # spam, but "higher" still means "capped", never unbounded (an
+        # uncapped path here would undo the entire guarantee this engine
+        # exists to provide).
+        self.final_max_chars = final_max_chars
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
 
@@ -365,6 +398,16 @@ class PersistentREPL:
                 "rather than printing raw data]"
             )
             result["truncated"] = True
+
+        final_text = result.get("final")
+        if isinstance(final_text, str) and len(final_text) > self.final_max_chars:
+            omitted = len(final_text) - self.final_max_chars
+            result["final"] = (
+                final_text[: self.final_max_chars]
+                + f"\n...[truncated, {omitted} more chars omitted -- final() "
+                "is capped higher than routine output, not unlimited]"
+            )
+            result["final_truncated"] = True
         return result
 
     def _read_with_timeout(self, timeout: float) -> Optional[str]:

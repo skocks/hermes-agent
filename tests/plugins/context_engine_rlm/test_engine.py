@@ -412,3 +412,108 @@ def test_code_log_survives_reset(tmp_path, _cleanup_repl):
     repl.exec("reset()")
     r = repl.exec("print(code_log(10))")
     assert "my_func" in r["stdout"]
+
+
+# ---------------------------------------------------------------------------
+# M6 — resume watermark inflation must not silently skip real content
+# ---------------------------------------------------------------------------
+
+def test_m6_inflated_resume_count_verified_and_corrected(tmp_path):
+    """The narrow case a plain len(messages) < persisted_count shrink-guard
+    misses: an inflated message_count() LOWER than the live transcript's
+    length at resume. Without content verification this silently skips
+    real archived content forever, because the count "looks" consistent.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    # Plant an inflated archive: 2 real rows + 5 unrelated "stale" rows,
+    # simulating rows left behind by an earlier shrink+resync duplication.
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}])
+    engine._store.append_messages("s1", 1, [{"role": "user", "content": f"stale-{i}"} for i in range(5)])
+    assert engine._store.message_count("s1") == 7
+
+    # True resume: a fresh engine instance, live transcript continuing from
+    # the real 2-message base, now at 9 messages -- LONGER than the
+    # inflated count, so the existing shrink-guard alone would not fire.
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    assert engine2._persisted_count == 7  # provisional, unverified
+    assert engine2._resume_verified is False
+
+    live = [{"role": "user", "content": c} for c in "abcdefghi"]
+    engine2.on_turn_complete(live, turn_id=2)
+
+    import sqlite3
+    rows = [
+        r[0] for r in sqlite3.connect(str(tmp_path / "rlm.db"))
+        .execute("SELECT content FROM rlm_messages WHERE session_id='s1' ORDER BY id").fetchall()
+    ]
+    missing = [c for c in "cdefg" if c not in rows]
+    assert not missing, f"content silently skipped: {missing}"
+    assert engine2._resume_verified is True
+
+
+def test_m6_verified_resume_does_not_resync_unnecessarily(tmp_path):
+    """The common case -- a real, non-inflated resume -- must not pay a
+    full resync (duplicate rows) just because verification now runs.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    engine.on_turn_complete([{"role": "user", "content": c} for c in "abcde"], turn_id=1)
+    assert engine._store.message_count("s1") == 5
+
+    engine2 = _make_engine(tmp_path)
+    engine2.on_session_start("s1")
+    live = [{"role": "user", "content": c} for c in "abcdef"]  # one new message: 'f'
+    engine2.on_turn_complete(live, turn_id=2)
+
+    assert engine2._store.message_count("s1") == 6, "must not duplicate a/b/c/d/e when the count was accurate"
+
+
+# ---------------------------------------------------------------------------
+# M5 — final() gets a higher cap than routine stdout, but still a cap
+# ---------------------------------------------------------------------------
+
+def test_final_passes_through_under_its_cap(tmp_path, _cleanup_repl):
+    _, repl = _archive_and_repl(
+        tmp_path, [{"role": "user", "content": "x"}],
+        max_output_chars=100, final_max_chars=500,
+    )
+    _cleanup_repl.append(repl)
+    r = repl.exec("final('X' * 300)")
+    assert r.get("final") == "X" * 300
+    assert not r.get("final_truncated")
+
+
+def test_final_still_capped_above_its_limit(tmp_path, _cleanup_repl):
+    _, repl = _archive_and_repl(
+        tmp_path, [{"role": "user", "content": "x"}],
+        max_output_chars=100, final_max_chars=500,
+    )
+    _cleanup_repl.append(repl)
+    r = repl.exec("final('Y' * 1000)")
+    assert r.get("final_truncated") is True
+    assert len(r["final"]) < 1000, "final() must never be truly unbounded"
+
+
+def test_final_cap_is_higher_than_routine_stdout_cap(tmp_path, _cleanup_repl):
+    _, repl = _archive_and_repl(
+        tmp_path, [{"role": "user", "content": "x"}],
+        max_output_chars=100, final_max_chars=500,
+    )
+    _cleanup_repl.append(repl)
+    r_stdout = repl.exec("print('Z' * 300)")
+    assert r_stdout.get("truncated") is True, "routine print() must use the smaller, more aggressive cap"
+
+    r_final = repl.exec("final('Z' * 300)")
+    assert not r_final.get("final_truncated"), "the same length must pass through final()'s higher cap"
+
+
+def test_final_absent_when_not_called(tmp_path, _cleanup_repl):
+    _, repl = _archive_and_repl(tmp_path, [{"role": "user", "content": "x"}])
+    _cleanup_repl.append(repl)
+    r = repl.exec("print('no final call')")
+    assert "final" not in r
