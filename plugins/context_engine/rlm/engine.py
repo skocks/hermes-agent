@@ -92,7 +92,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PROTECT_FIRST_N = 3
 _DEFAULT_PROTECT_LAST_N = 25
 _DEFAULT_TAIL_TOKEN_BUDGET_FRACTION = 0.5  # of context_length, for the tail slice
-_MARKER_BUCKET = 5  # round the "N messages dropped" count to this, for cache stability
+_DEFAULT_DROP_CHUNK_SIZE = 20  # round-15: quantized tail boundary step, see _select_tail()
 
 RLM_REPL_SCHEMA = {
     "name": "rlm_repl",
@@ -172,7 +172,24 @@ class RLMContextEngine(ContextEngine):
         cfg = full_cfg.get("rlm", {}) or {}
         _delegation_cfg = full_cfg.get("delegation", {}) or {}
         self.protect_first_n: int = int(cfg.get("protect_first_n", _DEFAULT_PROTECT_FIRST_N))
+        # Round-15: protect_last_n is now a MINIMUM, not an exact trailing
+        # count -- see _select_tail()'s docstring for why (prefix-cache
+        # stability: a sliding exact-N window shifts by one message every
+        # request, invalidating a strict prefix-matching KV cache almost
+        # entirely on every turn). The actual tail size floats between
+        # protect_last_n and protect_last_n + drop_chunk_size - 1.
         self.protect_last_n: int = int(cfg.get("protect_last_n", _DEFAULT_PROTECT_LAST_N))
+        # How many messages the drop boundary advances by at a time,
+        # instead of shifting by one every request. Bigger = more turns
+        # share an identical prefix (cheaper prefill) but a larger tail
+        # once the boundary does advance (one turn pays more, less often).
+        self._drop_chunk_size: int = max(1, int(cfg.get("drop_chunk_size", _DEFAULT_DROP_CHUNK_SIZE)))
+        # Persists across requests/turns within a session (NOT per-turn --
+        # the whole point is to advance rarely). Absolute index into the
+        # current session's non-system message list; reset on session
+        # start/reset since it's meaningless against a different
+        # conversation. See _select_tail().
+        self._tail_boundary: int = 0
         self._tail_token_fraction: float = float(
             cfg.get("tail_token_budget_fraction", _DEFAULT_TAIL_TOKEN_BUDGET_FRACTION)
         )
@@ -469,7 +486,7 @@ class RLMContextEngine(ContextEngine):
         if dropped <= 0:
             return messages
         return _enforce_system_message_position(
-            system + head + [self._dropped_marker(dropped)] + tail
+            system + head + [self._dropped_marker()] + tail
         )
 
     # -- the actual mechanism --------------------------------------------------
@@ -506,14 +523,14 @@ class RLMContextEngine(ContextEngine):
         if len(non_system) <= self.protect_first_n + self.protect_last_n:
             return None  # nothing to drop yet — leave the request untouched
 
-        tail = self._token_bounded_tail(non_system, budget_tokens)
+        tail = self._select_tail(non_system, budget_tokens)
         head = non_system[: self.protect_first_n]
         dropped = len(non_system) - len(head) - len(tail)
         if dropped <= 0:
             return None
 
         system = [m for m in request_messages if m.get("role") == "system"][:1]
-        marker = self._dropped_marker(dropped)
+        marker = self._dropped_marker()
 
         if self._auto_recall and self._store:
             recall = self._cached_auto_recall_snippet(incoming_message)
@@ -682,18 +699,79 @@ class RLMContextEngine(ContextEngine):
         # result. This is non-negotiable, not a best-effort measure.
         return _truncate_to_tokens(content.strip(), self._auto_recall_max_tokens)
 
-    def _token_bounded_tail(
+    def _select_tail(
         self, non_system: List[Dict[str, Any]], budget_tokens: int
     ) -> List[Dict[str, Any]]:
-        """Take up to protect_last_n trailing messages, capped by a token budget.
+        """Round-15: WHICH messages form the tail -- quantized so
+        consecutive requests share an identical prefix instead of sliding
+        by one message every time.
+
+        The prior behavior (non_system[-protect_last_n:]) is an exact
+        trailing window: by construction it shifts by however many
+        messages were added since the last call, EVERY single request
+        (select_context runs once per provider request, per M4 -- not
+        once per turn). Measured against real TabbyAPI turn logs: RLM
+        turns averaged 88% UNCACHED tokens and ~10x the prefill time of
+        non-RLM turns on the same box, because a strict-prefix-matching
+        KV cache invalidates from the first byte that differs onward --
+        and with a sliding window, that first differing byte is near the
+        very front of the tail almost every request. We were trading
+        context length for prefill compute, and on this hardware that
+        trade loses badly. (An earlier attempt at this, _MARKER_BUCKET,
+        rounded the dropped-count string in the marker to reduce churn --
+        insufficient on its own, since the tail itself still moved every
+        request regardless of what the marker said; removed in this same
+        round in favor of a constant marker, see _dropped_marker().)
+
+        Fix: the boundary (index into non_system where the tail begins)
+        only advances in steps of self._drop_chunk_size, and only ever
+        forward (self._tail_boundary persists across requests within a
+        session). Between advances, non_system[boundary:] for request K+1
+        is exactly non_system[boundary:] for request K PLUS whatever new
+        messages arrived since -- a pure append, exactly what prefix
+        caching wants. N-1 out of N requests (chunk_size-ish) become
+        near-free; one pays a reprefill when the boundary steps. This is
+        also why protect_last_n is now a MINIMUM: the actual tail floats
+        between protect_last_n and protect_last_n + drop_chunk_size - 1
+        messages, only ever snapping back down to protect_last_n-ish
+        right after the boundary advances.
+
+        Hitting the token cap (see _bound_tail_tokens) is itself treated
+        as a legitimate reason to advance the boundary early, not just a
+        per-request truncation: without that, an oversized tail would get
+        re-trimmed (and re-shifted) identically on every subsequent
+        request, which is the exact instability this method exists to
+        remove. So a cap-forced trim permanently advances the boundary to
+        where the trim actually starts.
+        """
+        n = len(non_system)
+        if n == 0 or self.protect_last_n <= 0:
+            self._tail_boundary = n
+            return []
+        min_boundary = max(0, n - self.protect_last_n)
+        quantized = (min_boundary // self._drop_chunk_size) * self._drop_chunk_size
+        boundary = min(max(self._tail_boundary, quantized), n)
+        candidates = non_system[boundary:]
+        trimmed = self._bound_tail_tokens(candidates, budget_tokens)
+        if len(trimmed) < len(candidates):
+            boundary = n - len(trimmed)
+        self._tail_boundary = boundary
+        return trimmed
+
+    def _bound_tail_tokens(
+        self, candidates: List[Dict[str, Any]], budget_tokens: int
+    ) -> List[Dict[str, Any]]:
+        """Cap an already-selected tail slice by token budget.
 
         Message-count protection alone can still blow the context if the
         tail happens to contain a few huge tool results. Walk backward and
         stop early if the token estimate exceeds the configured fraction of
         the model's context window — better a shorter-but-safe tail than a
-        request that 400s on overflow.
+        request that 400s on overflow. Takes the candidate slice directly
+        (from _select_tail's quantized boundary) rather than slicing
+        non_system itself -- WHICH messages form the tail and HOW MANY of
+        them fit the token budget are separate concerns now.
         """
-        candidates = non_system[-self.protect_last_n :] if self.protect_last_n else []
         if not candidates:
             return []
         token_cap = int((budget_tokens or self.context_length or 0) * self._tail_token_fraction)
@@ -719,12 +797,25 @@ class RLMContextEngine(ContextEngine):
         kept.reverse()
         return kept or [_truncate_message(candidates[-1], token_cap)]
 
-    def _dropped_marker(self, dropped: int) -> Dict[str, Any]:
-        bucket = max(_MARKER_BUCKET, (dropped // _MARKER_BUCKET) * _MARKER_BUCKET)
+    def _dropped_marker(self) -> Dict[str, Any]:
+        """Round-15: constant text, no embedded count. It used to report a
+        bucketed dropped-message count (_MARKER_BUCKET, rounded to 5) --
+        removed, not just left as-is, because the marker sits near the
+        front of the request (system + head + [marker] + tail) where a
+        strict-prefix-matching KV cache is most sensitive: ANY change here
+        invalidates the marker itself plus the entire tail after it,
+        regardless of whether the tail's own content actually changed.
+        Bucketing to 5 reduced how often that happened; it didn't stop it,
+        and round-15's actual measurement (real TabbyAPI turn logs, not a
+        guess) is what showed a "reduced" cache break was still a
+        devastating one on this hardware. The count was never something
+        the model acted on -- it's not worth a cache break at any
+        granularity, so it's gone, not bucketed further.
+        """
         return {
             "role": self._marker_role,
             "content": (
-                f"[RLM: roughly {bucket} earlier message(s) omitted from this "
+                "[RLM: some earlier messages were omitted from this "
                 "context to keep it small — archived, not deleted. Use "
                 "rlm_repl (history()/rlm_query() are pre-loaded) if you "
                 "need something from earlier in this conversation.]"
@@ -920,6 +1011,13 @@ class RLMContextEngine(ContextEngine):
         # across /new, so without this a stale cross-session cache entry
         # is a real, not theoretical, risk).
         self._auto_recall_cache = None
+        # Round-15: the tail boundary is an absolute index into THIS
+        # session's non-system message list -- meaningless (and, since it
+        # persists across requests by design, dangerous: min(...,n)
+        # clamps out-of-range but a stale large value would otherwise
+        # start a new session with an artificially empty tail) against a
+        # different session's conversation.
+        self._tail_boundary = 0
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         if self._repl is not None:
@@ -945,6 +1043,7 @@ class RLMContextEngine(ContextEngine):
         self._resume_verified = True  # count is 0, nothing to verify
         self._next_turn_id = 0
         self._auto_recall_cache = None
+        self._tail_boundary = 0
         if self._repl is not None:
             self._repl.close()
             self._repl = None

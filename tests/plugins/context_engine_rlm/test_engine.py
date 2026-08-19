@@ -10,9 +10,12 @@ manually against the running local server, not in CI.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from plugins.context_engine.rlm.engine import RLMContextEngine
+from agent.model_metadata import estimate_tokens_rough
+from plugins.context_engine.rlm.engine import RLMContextEngine, _content_as_text
 from plugins.context_engine.rlm.repl import PersistentREPL
 
 
@@ -1420,3 +1423,121 @@ def test_auto_recall_cache_survives_growth_under_the_threshold(tmp_path):
         convo = convo + [{"role": "user", "content": "extra1"}, {"role": "user", "content": "extra2"}]
         engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
         assert mocked.call_count == 1, "growth under protect_last_n must not force a premature recompute"
+
+
+# ---------------------------------------------------------------------------
+# Round-15: quantized tail boundary for prefix-cache stability. Real
+# TabbyAPI turn logs (592 turns) showed RLM turns averaging 88% UNCACHED
+# tokens and ~10x the prefill time of non-RLM turns on the same box --
+# the old exact-N sliding tail window shifted by ~1 message every
+# provider request, breaking a strict-prefix-matching KV cache almost
+# every time.
+# ---------------------------------------------------------------------------
+
+def _serialize(messages):
+    return [json.dumps(m, sort_keys=True) for m in messages]
+
+
+def test_select_context_output_is_a_pure_append_when_boundary_unchanged(tmp_path):
+    """The actual point of round 15: consecutive requests within the same
+    chunk window must produce byte-identical PREFIXES, not just similar
+    lengths -- out2 must equal out1 plus newly-appended messages, nothing
+    reordered or rewritten in between.
+    """
+    engine = _make_engine(tmp_path, protect_first_n=2, protect_last_n=5, drop_chunk_size=20)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(30)
+    out1 = engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    assert out1 is not None
+
+    # One more provider round trip within the same turn -- a couple new
+    # messages, nowhere near drop_chunk_size=20.
+    convo2 = convo + [
+        {"role": "assistant", "content": "calling a tool"},
+        {"role": "user", "content": "tool result here"},
+    ]
+    out2 = engine.select_context(convo2, conversation_messages=convo2, budget_tokens=131072)
+    assert out2 is not None
+
+    s1, s2 = _serialize(out1), _serialize(out2)
+    assert len(s2) > len(s1), "the fixture must actually grow between calls"
+    assert s2[: len(s1)] == s1, (
+        "out2 must be out1 with new messages appended -- any reordering or "
+        "rewriting of the shared prefix defeats prefix caching entirely"
+    )
+
+
+def test_select_context_boundary_advances_past_chunk_size(tmp_path):
+    """Growth that crosses drop_chunk_size worth of new messages must
+    advance the boundary -- protect_last_n is a minimum, not a ceiling,
+    so the tail is allowed to grow for a while, but not indefinitely.
+    """
+    engine = _make_engine(tmp_path, protect_first_n=2, protect_last_n=5, drop_chunk_size=10)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(30)
+    engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    boundary_before = engine._tail_boundary
+
+    convo2 = convo + [{"role": "user", "content": f"extra{i}"} for i in range(15)]  # > drop_chunk_size
+    out2 = engine.select_context(convo2, conversation_messages=convo2, budget_tokens=131072)
+    assert out2 is not None
+    assert engine._tail_boundary > boundary_before, (
+        "growth past drop_chunk_size must advance the boundary, not let "
+        "the tail grow forever"
+    )
+    # protect_last_n is a floor: the tail must never end up shorter than it,
+    # even right after an advance.
+    non_system = [m for m in convo2 if m.get("role") != "system"]
+    tail_len = len(non_system) - engine._tail_boundary
+    assert tail_len >= engine.protect_last_n
+
+
+def test_select_context_token_cap_forces_early_boundary_advance(tmp_path):
+    """Hitting the token cap is itself a legitimate reason to advance the
+    boundary early (per the spec) -- not just a one-off per-request trim
+    that would otherwise re-trim (and re-shift) the same oversized head
+    on every subsequent request.
+    """
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=10, drop_chunk_size=20)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    huge = "x " * 2000  # ~500 tokens/message at the ~4-char/token estimate
+    convo = [{"role": "system", "content": "sys"}] + [
+        {"role": "user", "content": f"{huge} {i}"} for i in range(15)
+    ]
+    # Tiny budget: protect_last_n=10 candidates can't possibly all fit.
+    out = engine.select_context(convo, conversation_messages=convo, budget_tokens=600)
+    assert out is not None
+
+    non_system = [m for m in convo if m.get("role") != "system"]
+    assert engine._tail_boundary > len(non_system) - engine.protect_last_n, (
+        "the cap-forced trim must permanently advance the boundary past "
+        "where an untrimmed quantized boundary would have landed"
+    )
+
+    # Token budget must still actually bound what's sent, not just move
+    # the boundary marker around.
+    tail_tokens = sum(estimate_tokens_rough(_content_as_text(m)) for m in out if m is not out[0])
+    assert tail_tokens < 20000  # generous upper bound -- must not be anywhere near unbounded
+
+
+def test_bound_tail_tokens_still_caps_an_oversized_slice(tmp_path):
+    """Direct unit coverage of the token-cap pass in isolation from the
+    boundary-quantization pass -- the budget must still actually bound
+    the tail regardless of which messages were selected to be in it.
+    """
+    engine = _make_engine(tmp_path)
+    huge = "x " * 5000
+    candidates = [{"role": "user", "content": f"{huge} {i}"} for i in range(5)]
+
+    capped = engine._bound_tail_tokens(candidates, budget_tokens=1000)
+    assert len(capped) < len(candidates), "an oversized slice must actually be trimmed"
+
+    total_tokens = sum(estimate_tokens_rough(_content_as_text(m)) for m in capped)
+    token_cap = int(1000 * engine._tail_token_fraction)
+    assert total_tokens <= token_cap * 1.2  # slack: char-based token estimate, not exact

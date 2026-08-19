@@ -1799,15 +1799,37 @@ DEFAULT_CONFIG = {
         # Non-system messages always kept verbatim at the head of the
         # transcript, in addition to the system prompt.
         "protect_first_n": 3,
-        # Non-system messages always kept verbatim at the tail (most
-        # recent), subject to tail_token_budget_fraction below.
+        # Non-system messages kept verbatim at the tail (most recent),
+        # subject to tail_token_budget_fraction below. Round-15: this is a
+        # MINIMUM now, not an exact trailing count -- the actual tail
+        # floats between protect_last_n and protect_last_n +
+        # drop_chunk_size - 1 messages. See drop_chunk_size below for why.
         "protect_last_n": 25,
+        # Round-15: how many messages the drop boundary advances by at a
+        # time, instead of shifting by exactly one every provider request
+        # (which is what an exact-N trailing window does -- select_context
+        # runs once per request, per M4, not once per turn). Measured
+        # against real TabbyAPI turn logs: the old sliding window averaged
+        # 88% UNCACHED tokens and ~10x the prefill time of non-RLM turns
+        # on the same box, because a strict-prefix-matching KV cache
+        # invalidates from the first differing byte onward, and with a
+        # 1-message slide that byte lands near the front of the tail on
+        # almost every request. Quantizing the boundary means requests
+        # between advances are a pure append to an identical prefix
+        # (cache-friendly); one request in ~drop_chunk_size pays a
+        # reprefill. Bigger = cheaper prefill, more turns share a prefix,
+        # but a larger tail (more live tokens sent) once the boundary does
+        # advance -- tune against this model server's actual prefix-cache
+        # behavior, not blindly.
+        "drop_chunk_size": 20,
         # Cap the tail slice to this fraction of the model's context
         # window, walking backward from the most recent message, so a few
         # huge tool results in the tail can't blow the request even when
-        # protect_last_n's message count would otherwise allow it.
+        # protect_last_n's message count would otherwise allow it. Hitting
+        # this cap also forces an early boundary advance (round-15) rather
+        # than re-trimming the same oversized head every request.
         "tail_token_budget_fraction": 0.5,
-        # Role used for the synthetic "N messages omitted" marker inserted
+        # Role used for the synthetic "messages omitted" marker inserted
         # where the dropped middle used to be. The marker always lands
         # mid-conversation (after protect_first_n), never at index 0 --
         # setting this to "system" is a real production outage, not a
