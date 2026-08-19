@@ -1,0 +1,12 @@
+name: rlm
+version: 0.1.0
+description: >
+  Recursive Language Model context engine. Keeps full conversation history
+  external (SQLite), hands the root model a small fixed-size context every
+  turn via select_context(), and lets it recurse into older history on
+  demand via the rlm_query tool (plus the existing code_execution /
+  delegate_task tools for anything rlm_query can't cover). Avoids the
+  lossy summarization the built-in compressor and hermes-lcm both still
+  do. Toggle without switching engines: rlm.enabled in config.yaml.
+author: draft
+kind: context_engine

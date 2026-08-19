@@ -1792,6 +1792,73 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # RLM (Recursive Language Model) context engine -- plugins/context_engine/rlm/.
+    # Only takes effect when context.engine is set to "rlm" above; these keys
+    # are read directly by the plugin, not enforced by the host.
+    "rlm": {
+        # Non-system messages always kept verbatim at the head of the
+        # transcript, in addition to the system prompt.
+        "protect_first_n": 3,
+        # Non-system messages always kept verbatim at the tail (most
+        # recent), subject to tail_token_budget_fraction below.
+        "protect_last_n": 25,
+        # Cap the tail slice to this fraction of the model's context
+        # window, walking backward from the most recent message, so a few
+        # huge tool results in the tail can't blow the request even when
+        # protect_last_n's message count would otherwise allow it.
+        "tail_token_budget_fraction": 0.5,
+        # Role used for the synthetic "N messages omitted" marker inserted
+        # where the dropped middle used to be. "system" works for
+        # OpenAI-compatible chat_completions backends (the default here);
+        # switch to "user" for providers that reject multiple system-role
+        # messages in one request.
+        "marker_role": "system",
+        # SQLite file archiving every message dropped from context.
+        # Default: <hermes home>/rlm.db (next to config.yaml).
+        "db_path": "",
+        # rlm_repl: a persistent Python REPL subprocess, one per session,
+        # exposing history()/rlm_query() -- see plugins/context_engine/rlm/
+        # repl.py for the mechanism. Per-call wall-clock timeout; a call
+        # that exceeds it kills and restarts the REPL (session state lost,
+        # but the turn doesn't hang forever).
+        "repl_timeout_seconds": 15.0,
+        # Hard cap on one rlm_repl call's captured stdout, regardless of
+        # whether the model remembered to digest a large result itself via
+        # rlm_query() first -- this is what keeps root's context protected
+        # even when the model doesn't cooperate.
+        "repl_max_output_chars": 8000,
+        # Model rlm_query() (inside the REPL) recurses against. "" = reuse
+        # the root model (same one active via model.default / the
+        # session's current model).
+        "repl_query_model": "",
+        # Auto-recall: forced (not voluntary) recovery. Every turn past the
+        # drop threshold, a cheap keyword check against the incoming user
+        # message decides whether dropped history plausibly matters here --
+        # if so, a digested-and-capped snippet is injected into the request
+        # directly, with no dependence on the model noticing the drop
+        # marker or choosing to call rlm_repl. Set false to fall back to
+        # voluntary-only recovery (rlm_repl, called at the model's own
+        # discretion).
+        "auto_recall": True,
+        # Words shorter than this are ignored when extracting keywords from
+        # the incoming message for the relevance check.
+        "auto_recall_min_keyword_len": 4,
+        "auto_recall_max_keywords": 6,
+        # Fewer than this many extracted keywords = not enough signal to
+        # trust a match (validated against a real session: "yes update"
+        # extracted to one generic keyword and matched unrelated content).
+        "auto_recall_min_keywords": 2,
+        # Matches at or below this token estimate are injected raw (a
+        # digestion sub-call costs more than it saves); above it, digested
+        # via an auxiliary LLM call first.
+        "auto_recall_digest_threshold_tokens": 400,
+        # Hard cap on what auto-recall ever injects, enforced regardless of
+        # digestion outcome (success, failure, or a sub-call that ignores
+        # its own max_tokens) -- root is protected from an unbounded
+        # lookup result no matter how the digestion attempt resolves.
+        "auto_recall_max_tokens": 300,
+    },
+
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
         "memory_enabled": True,
