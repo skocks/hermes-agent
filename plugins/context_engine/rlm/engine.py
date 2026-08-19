@@ -198,6 +198,17 @@ class RLMContextEngine(ContextEngine):
         self._auto_recall_digest_threshold_tokens: int = int(cfg.get("auto_recall_digest_threshold_tokens", 400))
         self._auto_recall_max_tokens: int = int(cfg.get("auto_recall_max_tokens", 300))
         self._db_path: str = cfg.get("db_path") or self._default_db_path()
+        # Round-9: retention for rlm.db is NOT an RLM-specific setting --
+        # deliberately no rlm.retention_days key exists. RLM's archive
+        # follows state.db's own session lifecycle (sessions.auto_prune /
+        # retention_days / min_interval_hours / vacuum_after_prune /
+        # min_vacuum_interval_days, the SAME keys state.db's own
+        # maybe_auto_prune_and_vacuum already uses), so it just reads that
+        # existing config block. See store.py's sweep_orphaned_sessions()
+        # and its module docstring for the actual "RLM follows, never
+        # leads" mechanism.
+        self._sessions_cfg: Dict[str, Any] = full_cfg.get("sessions", {}) or {}
+        self._state_db_path: str = self._default_state_db_path()
 
         self._session_id: str = "unknown"
         self._persisted_count: int = 0  # how many of the live `messages` we've archived
@@ -258,6 +269,14 @@ class RLMContextEngine(ContextEngine):
             return str(get_config_path().parent / "rlm.db")
         except Exception:
             return str(Path.home() / ".hermes" / "rlm.db")
+
+    @staticmethod
+    def _default_state_db_path() -> str:
+        try:
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home() / "state.db")
+        except Exception:
+            return str(Path.home() / ".hermes" / "state.db")
 
     def is_available(self) -> bool:
         return self._store is not None
@@ -729,6 +748,23 @@ class RLMContextEngine(ContextEngine):
                 # store is unhappy for the same underlying reason.
                 self._trigger_resync()
                 self._resume_verified = True
+            # Round-9: throttled internally (rlm_meta, not this call site),
+            # so calling it on every on_session_start -- including every
+            # /new, since this engine instance is reused rather than
+            # reconstructed -- is safe and normally a no-op. Never allowed
+            # to block session start: sweep_orphaned_sessions() itself
+            # fails open and never raises, but this session must start
+            # regardless of what happens here either way.
+            try:
+                self._store.sweep_orphaned_sessions(
+                    self._state_db_path,
+                    current_session_id=self._session_id,
+                    min_interval_hours=int(self._sessions_cfg.get("min_interval_hours", 24)),
+                    vacuum_after_prune=bool(self._sessions_cfg.get("vacuum_after_prune", True)),
+                    min_vacuum_interval_days=int(self._sessions_cfg.get("min_vacuum_interval_days", 30)),
+                )
+            except Exception:
+                logger.exception("RLM: orphan sweep call site failed")
         else:
             self._persisted_count = 0
             self._resume_verified = True

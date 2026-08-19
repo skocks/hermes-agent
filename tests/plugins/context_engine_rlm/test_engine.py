@@ -907,3 +907,165 @@ def test_search_any_falls_back_to_like_when_fts_disabled(tmp_path):
     assert len(hits) == 1
     assert store.search_any("s1", ["zzznotfound"]) == []
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round-9: retention. rlm.db has no clock/config of its own -- an archived
+# session is only ever deleted once it's absent from state.db's `sessions`
+# table (sweep_orphaned_sessions). No rlm.retention_days key exists or
+# should exist; sessions.* config is reused verbatim.
+# ---------------------------------------------------------------------------
+
+def _make_state_db(tmp_path, session_ids):
+    """A minimal state.db stand-in: just enough of the real `sessions`
+    table shape (id is all sweep_orphaned_sessions/_existing_state_db_sessions
+    ever reads) for the sweep to query against.
+    """
+    import sqlite3
+    path = str(tmp_path / "state.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at REAL)")
+    conn.executemany(
+        "INSERT INTO sessions (id, started_at) VALUES (?, 0)",
+        [(sid,) for sid in session_ids],
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_sweep_deletes_orphaned_session_rows_and_fts_entries(tmp_path):
+    """A session_id present in rlm.db but absent from state.db is an
+    orphan: its rows -- live AND tombstoned -- and its FTS5 entries are
+    all removed. This is a real DELETE, unlike supersede_session's
+    tombstone -- by design, this is rlm.db's only deletion path.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    assert store._fts_enabled
+    store.append_messages("orphan", 1, [{"role": "user", "content": "will be swept"}])
+    store.append_messages("orphan", 2, [{"role": "user", "content": "also swept"}])
+    store.supersede_session("orphan")  # tombstone one round, so both live+dead rows exist
+    store.append_messages("orphan", 3, [{"role": "user", "content": "swept too"}])
+    assert store.raw_row_count("orphan") == 3
+
+    state_db = _make_state_db(tmp_path, [])  # state.db knows nothing of "orphan"
+    result = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+
+    assert result["sessions_pruned"] == 1
+    assert result["rows_deleted"] == 3
+    assert store.raw_row_count("orphan") == 0
+    fts_rows = store._conn.execute(
+        "SELECT COUNT(*) FROM rlm_search WHERE session_id = ?", ("orphan",)
+    ).fetchone()[0]
+    assert fts_rows == 0, "FTS mirror must be swept too, not just rlm_messages"
+    store.close()
+
+
+def test_sweep_preserves_session_present_in_state_db_even_fully_superseded(tmp_path):
+    """Existing in state.db is the whole test -- a session with every row
+    tombstoned must still be kept if state.db still knows about it.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("kept", 1, [{"role": "user", "content": "still tracked"}])
+    store.supersede_session("kept")  # message_count("kept") == 0, but state.db has the row
+
+    state_db = _make_state_db(tmp_path, ["kept"])
+    result = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+
+    assert result["sessions_pruned"] == 0
+    assert result["rows_deleted"] == 0
+    assert store.raw_row_count("kept") == 1
+    store.close()
+
+
+def test_sweep_never_deletes_current_session_even_if_absent_from_state_db(tmp_path):
+    """Guards the race between session start and state.db's own (fallible)
+    create_session() call -- current_session_id is excluded regardless of
+    what state.db shows.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("live", 1, [{"role": "user", "content": "just started"}])
+
+    state_db = _make_state_db(tmp_path, [])  # state.db hasn't caught up yet
+    result = store.sweep_orphaned_sessions(state_db, current_session_id="live", min_interval_hours=0)
+
+    assert result["sessions_pruned"] == 0
+    assert store.raw_row_count("live") == 1
+    store.close()
+
+
+def test_sweep_deletes_nothing_when_state_db_missing(tmp_path):
+    """Fail-open: an unreadable/missing state.db must never be treated as
+    'state.db has no sessions' -- that would delete everything. Nothing is
+    deleted and the failure is reported, not swallowed silently.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("s1", 1, [{"role": "user", "content": "x"}])
+
+    result = store.sweep_orphaned_sessions(
+        str(tmp_path / "does-not-exist.db"), min_interval_hours=0
+    )
+    assert result["sessions_pruned"] == 0
+    assert result["rows_deleted"] == 0
+    assert "error" in result
+    assert store.raw_row_count("s1") == 1
+    store.close()
+
+
+def test_sweep_no_op_when_no_session_missing(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("s1", 1, [{"role": "user", "content": "x"}])
+    state_db = _make_state_db(tmp_path, ["s1"])
+
+    result = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+    assert result == {"skipped": False, "sessions_pruned": 0, "rows_deleted": 0, "vacuumed": False}
+    assert store.raw_row_count("s1") == 1
+    store.close()
+
+
+def test_sweep_throttled_by_min_interval_hours(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("orphan", 1, [{"role": "user", "content": "x"}])
+    state_db = _make_state_db(tmp_path, [])
+
+    first = store.sweep_orphaned_sessions(state_db, min_interval_hours=24)
+    assert first["skipped"] is False
+    assert first["sessions_pruned"] == 1
+
+    store.append_messages("orphan2", 1, [{"role": "user", "content": "y"}])
+    second = store.sweep_orphaned_sessions(state_db, min_interval_hours=24)
+    assert second["skipped"] is True
+    assert store.raw_row_count("orphan2") == 1, "throttled sweep must not run at all"
+    store.close()
+
+
+def test_sweep_vacuum_gated_by_deleted_rows_and_min_vacuum_interval(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    state_db = _make_state_db(tmp_path, [])
+
+    # Nothing to delete -> no vacuum, even though vacuum_after_prune=True.
+    r1 = store.sweep_orphaned_sessions(state_db, min_interval_hours=0, vacuum_after_prune=True)
+    assert r1["sessions_pruned"] == 0
+    assert r1["vacuumed"] is False
+
+    store.append_messages("orphan", 1, [{"role": "user", "content": "x"}])
+    r2 = store.sweep_orphaned_sessions(
+        state_db, min_interval_hours=0, vacuum_after_prune=True, min_vacuum_interval_days=30
+    )
+    assert r2["sessions_pruned"] == 1
+    assert r2["vacuumed"] is True
+
+    store.append_messages("orphan2", 1, [{"role": "user", "content": "y"}])
+    r3 = store.sweep_orphaned_sessions(
+        state_db, min_interval_hours=0, vacuum_after_prune=True, min_vacuum_interval_days=30
+    )
+    assert r3["sessions_pruned"] == 1
+    assert r3["vacuumed"] is False, "min_vacuum_interval_days must throttle even with fresh deletes"
+    store.close()

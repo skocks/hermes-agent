@@ -10,6 +10,19 @@ than going through this class at all — WAL mode is exactly the mode that
 makes that safe. A process-local lock additionally serializes writes from
 this engine's own instance (SQLite's per-connection API isn't thread-safe
 on its own even with check_same_thread=False).
+
+Retention: rlm.db has no independent retention policy and never will —
+see sweep_orphaned_sessions(). It inherits state.db's session lifecycle
+instead: a session's RLM archive (including its tombstoned/superseded
+rows and its FTS5 index entries) is only ever deleted once that session
+no longer exists in state.db's `sessions` table, via the SAME
+`sessions.auto_prune` / `retention_days` / `min_interval_hours` /
+`vacuum_after_prune` / `min_vacuum_interval_days` config keys state.db's
+own SessionDB.maybe_auto_prune_and_vacuum already uses — no
+`rlm.retention_days` or other RLM-specific age setting exists, or should
+ever be added. If session pruning is off (the default), state.db never
+loses a session_id, so this sweep deletes nothing. RLM follows state.db's
+retention; it does not own or lead it.
 """
 
 from __future__ import annotations
@@ -20,7 +33,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +60,10 @@ CREATE TABLE IF NOT EXISTS rlm_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_rlm_session_turn ON rlm_messages(session_id, turn_id);
 CREATE INDEX IF NOT EXISTS idx_rlm_session_ts ON rlm_messages(session_id, ts);
+CREATE TABLE IF NOT EXISTS rlm_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 # idx_rlm_session_superseded deliberately NOT in _SCHEMA above: on an
 # existing (pre-N2) database the table already exists, so CREATE TABLE IF
@@ -315,6 +332,171 @@ class RLMStore:
             )
             rows = [r[0] for r in cur.fetchall()]
         return list(reversed(rows))
+
+    # -- retention: inherited from state.db, never owned here -----------
+
+    def get_meta(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM rlm_meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO rlm_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    def sweep_orphaned_sessions(
+        self,
+        state_db_path: str,
+        current_session_id: Optional[str] = None,
+        min_interval_hours: int = 24,
+        vacuum_after_prune: bool = True,
+        min_vacuum_interval_days: int = 30,
+    ) -> Dict[str, Any]:
+        """Delete every RLM row (live and tombstoned alike) for a session
+        that no longer exists in state.db's `sessions` table. This is the
+        ONLY deletion path rlm.db has, and it deliberately has no clock or
+        config of its own -- see the module docstring. state.db is asked
+        "does this session still exist", never "how old is it"; RLM has no
+        opinion on age, only on presence.
+
+        Fail-open, same posture as select_context()'s "can't archive ->
+        don't drop" rule: state.db unreadable, the query failing, or
+        anything else going wrong here means nothing is deleted. A missed
+        sweep costs disk; a wrong delete costs data that can't come back
+        (unlike superseded rows, an orphan sweep is a real DELETE, not a
+        tombstone -- there is nothing left standing this class could ever
+        recover from a mistake here).
+
+        `current_session_id` is an explicit extra guard on top of the
+        state.db check, not a substitute for it: state.db's own
+        `sessions` row is written by a try/except-guarded call at session
+        start that can itself fail (see cli.py's `_session_db_created`
+        flag) or simply not have landed yet the instant this sweep runs.
+        Excluding the live session_id closes that race for the one
+        session this process actually has open; it does not, and cannot,
+        protect a same-moment race in another process's session -- state
+        is the arbiter there, same as everywhere else in this file.
+
+        Throttled like state.db's own maybe_auto_prune_and_vacuum(): at
+        most once per min_interval_hours (tracked in this store's own
+        rlm_meta, not state.db's state_meta -- RLM never writes to
+        state.db), and VACUUM (which does not run inside the delete's own
+        transaction -- SQLite disallows that) only when this sweep freed
+        rows AND min_vacuum_interval_days has elapsed since the last one.
+        """
+        result: Dict[str, Any] = {
+            "skipped": False, "sessions_pruned": 0, "rows_deleted": 0, "vacuumed": False,
+        }
+        try:
+            now = time.time()
+            last_raw = self.get_meta("last_orphan_sweep")
+            if last_raw:
+                try:
+                    if now - float(last_raw) < min_interval_hours * 3600:
+                        result["skipped"] = True
+                        return result
+                except (TypeError, ValueError):
+                    pass  # corrupt meta -- treat as no prior run, sweep anyway
+
+            with self._lock:
+                candidates = {
+                    r[0] for r in self._conn.execute(
+                        "SELECT DISTINCT session_id FROM rlm_messages"
+                    ).fetchall()
+                }
+            if current_session_id:
+                candidates.discard(current_session_id)
+            if not candidates:
+                self.set_meta("last_orphan_sweep", str(now))
+                return result
+
+            # Read-only, and a real failure to open/query must abort the
+            # whole sweep -- never treat "couldn't check state.db" as
+            # "state.db has nothing", which would delete everything.
+            existing = self._existing_state_db_sessions(state_db_path, candidates)
+            orphans = candidates - existing
+            if not orphans:
+                self.set_meta("last_orphan_sweep", str(now))
+                return result
+
+            orphans = list(orphans)
+            deleted = 0
+            with self._lock:
+                for i in range(0, len(orphans), 500):
+                    batch = orphans[i:i + 500]
+                    placeholders = ",".join("?" * len(batch))
+                    deleted += self._conn.execute(
+                        f"SELECT COUNT(*) FROM rlm_messages WHERE session_id IN ({placeholders})",
+                        batch,
+                    ).fetchone()[0]
+                    self._conn.execute(
+                        f"DELETE FROM rlm_messages WHERE session_id IN ({placeholders})", batch
+                    )
+                    if self._fts_enabled:
+                        self._conn.execute(
+                            f"DELETE FROM rlm_search WHERE session_id IN ({placeholders})", batch
+                        )
+                self._conn.commit()
+
+            result["sessions_pruned"] = len(orphans)
+            result["rows_deleted"] = deleted
+            self.set_meta("last_orphan_sweep", str(now))
+
+            last_vacuum_raw = self.get_meta("last_orphan_vacuum")
+            vacuum_due = True
+            if last_vacuum_raw:
+                try:
+                    vacuum_due = (now - float(last_vacuum_raw)) >= min_vacuum_interval_days * 86400
+                except (TypeError, ValueError):
+                    vacuum_due = True
+            if vacuum_after_prune and deleted > 0 and vacuum_due:
+                try:
+                    with self._lock:
+                        self._conn.execute("VACUUM")
+                    result["vacuumed"] = True
+                    self.set_meta("last_orphan_vacuum", str(now))
+                except Exception as exc:
+                    logger.warning("RLM: VACUUM after orphan sweep failed: %s", exc)
+
+            logger.info(
+                "RLM: orphan sweep removed %d row(s) across %d session(s) absent from state.db%s",
+                deleted, len(orphans), " + VACUUM" if result["vacuumed"] else "",
+            )
+        except Exception as exc:
+            logger.warning("RLM: orphan sweep failed, nothing deleted: %s", exc)
+            result["error"] = str(exc)
+        return result
+
+    @staticmethod
+    def _existing_state_db_sessions(state_db_path: str, candidates: set) -> set:
+        """Which of `candidates` still have a row in state.db's `sessions`
+        table. Opens state.db read-only via a plain sqlite3 URI connection
+        -- deliberately NOT importing hermes_state.SessionDB, which is a
+        heavy, write-capable class with its own production-DB safety
+        checks meant for a different caller. This only ever reads.
+        """
+        uri = f"file:{Path(state_db_path).expanduser()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            found: set = set()
+            candidates = list(candidates)
+            for i in range(0, len(candidates), 500):
+                batch = candidates[i:i + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = conn.execute(
+                    f"SELECT id FROM sessions WHERE id IN ({placeholders})", batch
+                ).fetchall()
+                found.update(r[0] for r in rows)
+            return found
+        finally:
+            conn.close()
 
     def close(self) -> None:
         with self._lock:
