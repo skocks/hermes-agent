@@ -1353,3 +1353,70 @@ def test_auto_recall_cache_does_not_leak_across_sessions(tmp_path):
             "a new session must not inherit the previous session's cached answer, "
             "even for byte-identical question text"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-14: the cache must invalidate on its own when mid-turn archive
+# growth (M4) exceeds protect_last_n, restoring exactly the uncached
+# behavior in the one case round 13 left open (content rolling out of the
+# live tail before the turn ends). Cheap check: _persisted_count drift,
+# no DB call.
+# ---------------------------------------------------------------------------
+
+def test_auto_recall_cache_invalidated_by_archive_drift_past_protect_last_n(tmp_path):
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True, protect_first_n=1, protect_last_n=5)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(30)
+    engine._archive_new(convo, turn_id=1)
+    _seed_recall_match(engine, "s1", "xylophone")
+    incoming = {"role": "user", "content": "tell me about the xylophone marmalade situation"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 1
+
+        # Same turn (no on_turn_complete) -- but the archive grows past
+        # protect_last_n's worth of new messages, simulating enough
+        # mid-turn tool round trips (protect_last_n=5 here) that some
+        # content archived before this point has rolled out of the live
+        # tail.
+        convo = convo + [{"role": "user", "content": f"extra{i}"} for i in range(8)]
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 2, "drift past protect_last_n within one turn must force a recompute"
+
+        # No further growth -> the freshly-recomputed entry is reused.
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 2, "without further drift, the new cache entry must still be served"
+
+
+def test_auto_recall_cache_survives_growth_under_the_threshold(tmp_path):
+    """The common case round 13 optimized for -- a turn that adds a
+    handful of messages and never trips the drift threshold -- must keep
+    the full saving, not recompute on every small archive change.
+    """
+    from unittest import mock
+
+    engine = _make_engine(tmp_path, auto_recall=True, protect_first_n=1, protect_last_n=5)
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = _convo(30)
+    engine._archive_new(convo, turn_id=1)
+    _seed_recall_match(engine, "s1", "xylophone")
+    incoming = {"role": "user", "content": "tell me about the xylophone marmalade situation"}
+
+    with mock.patch(
+        "agent.auxiliary_client.call_llm", return_value=_fake_llm_response("digested answer")
+    ) as mocked:
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 1
+
+        convo = convo + [{"role": "user", "content": "extra1"}, {"role": "user", "content": "extra2"}]
+        engine.select_context(convo, conversation_messages=convo, incoming_message=incoming, budget_tokens=131072)
+        assert mocked.call_count == 1, "growth under protect_last_n must not force a premature recompute"

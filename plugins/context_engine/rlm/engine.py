@@ -293,10 +293,12 @@ class RLMContextEngine(ContextEngine):
         # slot, not a dict: only ever one turn "in flight" per engine
         # instance. Keyed on a hash of the question TEXT, not the message
         # dict itself, so this never holds a live reference into the
-        # conversation. See _cached_auto_recall_snippet() for the full
-        # reasoning, including the one subtlety about mid-turn archive
-        # growth that a cached negative could in principle miss.
-        self._auto_recall_cache: Optional[tuple] = None  # (question_hash, snippet_or_None)
+        # conversation. Round-14 added the third field: _persisted_count
+        # at cache-write time, so a large enough mid-turn archive drift
+        # (content rolling out of the live tail before the turn ends)
+        # invalidates the entry instead of silently going stale. See
+        # _cached_auto_recall_snippet() for the full reasoning.
+        self._auto_recall_cache: Optional[tuple] = None  # (question_hash, snippet_or_None, persisted_count)
         # M6 fix: message_count(session_id) (a raw row total) is what
         # on_session_start uses to guess _persisted_count on resume -- but
         # it's inflatable by the shrink-guard's own past resyncs (each one
@@ -537,37 +539,51 @@ class RLMContextEngine(ContextEngine):
         Cleared in on_turn_complete()/on_session_start()/on_session_reset()
         -- nothing survives past the turn or session it was computed in.
 
-        One subtlety, worth stating explicitly rather than assuming it
-        away: _archive_new()/M4 mean the archive GROWS between requests
-        within a turn, so in principle a cached negative computed early in
-        a turn could miss content archived moments later in that SAME
-        turn. This is safe for the common case: anything just archived is,
-        by construction, at the tail of the live transcript
+        Round-14: also invalidated mid-turn on archive drift, closing a
+        real gap round 13 shipped documented-but-open. _archive_new()/M4
+        mean the archive GROWS between requests within a turn, so a
+        cached negative computed early in a turn could miss content
+        archived moments later in the SAME turn. Safe while that new
+        content is still in the live tail the model already sees
         (_token_bounded_tail always takes the current trailing
-        protect_last_n messages), so it's already visible to the model
-        directly -- auto-recall was never the mechanism that would have
-        surfaced it. It stops being safe only if a SINGLE turn's own tool
-        round trips add more than protect_last_n new messages before that
-        turn finishes: then content archived early in that turn can roll
-        out of the live tail before on_turn_complete() ever clears the
-        cache, while a stale negative (computed before that content
-        existed, or before it needed recall) keeps suppressing a search
-        that would now find it. Accepted as-is, not patched around: (1)
-        it requires a single turn long enough to itself exceed
-        protect_last_n in new messages, not a general case; (2) the
-        window is self-bounded -- it cannot outlive the turn; (3)
-        rlm_repl remains a fully reliable, voluntary path the model can
-        use directly regardless -- auto-recall is a pre-emptive
-        convenience on top of that, not the only way to reach archived
-        content, and round 13 made auto_recall opt-in specifically
-        because that voluntary path is now trustworthy.
+        protect_last_n messages -- auto-recall was never the mechanism
+        that would have surfaced something already in context). NOT safe
+        once it rolls out of that tail before the turn ends -- and with
+        protect_last_n defaulting to 25 and each tool call contributing
+        ~2 messages (assistant + tool result), ~13 tool calls in one turn
+        crosses that threshold. That's an ordinary agentic turn here, not
+        an edge case (round-13.md's initial "narrow" framing was wrong on
+        frequency; corrected there). What made the gap acceptable to ship
+        for one round was severity, not rarity: the content at risk is
+        the model's own recent tool output, already seen once when
+        produced, not what the user's question was about, and reachable
+        via rlm_repl regardless -- caching only downgrades a best-effort
+        pre-emptive hint, tail eviction is the actual data-visibility
+        mechanism either way.
+
+        Closed here at near-zero extra cost: no DB call needed, just
+        comparing self._persisted_count (already updated by _archive_new,
+        which runs before this every request thanks to M4) against the
+        count captured when this cache entry was written. Once the drift
+        exceeds protect_last_n, SOME already-archived content from this
+        turn is guaranteed to have rolled out of the tail since the cache
+        was populated, so a full recompute is triggered -- restoring
+        exactly the uncached behavior in precisely the case where caching
+        could have differed, while the common case (a turn adding a
+        handful of messages, never tripping the threshold) keeps the full
+        saving. Deliberately not a partial-refresh or incremental-merge
+        scheme -- that's real complexity for a pre-emptive hint on an
+        opt-in path, and would erode the reason memoization exists.
         """
         question = _message_text(incoming_message)
         key = hashlib.sha256(question.encode("utf-8")).hexdigest() if question else None
-        if self._auto_recall_cache is not None and self._auto_recall_cache[0] == key:
-            return self._auto_recall_cache[1]
+        if self._auto_recall_cache is not None:
+            cached_key, cached_snippet, cached_persisted_count = self._auto_recall_cache
+            drift = self._persisted_count - cached_persisted_count
+            if cached_key == key and drift <= self.protect_last_n:
+                return cached_snippet
         snippet = self._auto_recall_snippet(incoming_message)
-        self._auto_recall_cache = (key, snippet)
+        self._auto_recall_cache = (key, snippet, self._persisted_count)
         return snippet
 
     def _auto_recall_snippet(self, incoming_message: Optional[Dict[str, Any]]) -> Optional[str]:
