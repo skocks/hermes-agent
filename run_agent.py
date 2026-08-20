@@ -511,6 +511,21 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        # Round-22: provenance for context-engine plugins (RLM specifically,
+        # but the ABC is generic) -- forwarded to on_session_start's kwargs
+        # the same way boundary_reason/old_session_id already are for a
+        # compression fork. "conversation" (default) is a real, user-facing
+        # session; "background_review"/"subagent" mark a construction that
+        # inherited another session's transcript for its own, DIFFERENT
+        # purpose (skill/memory review, delegated subtask) rather than
+        # continuing it. inherited_message_count, when set, tells the
+        # engine exactly how much of the seeded conversation_history is
+        # NOT this session's own content, so it archives only what this
+        # agent actually generates instead of re-archiving what it was
+        # handed to review/read. See agent/background_review.py's
+        # _spawn_background_review for the motivating case.
+        agent_kind: str = "conversation",
+        inherited_message_count: int = 0,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -599,6 +614,8 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            agent_kind=agent_kind,
+            inherited_message_count=inherited_message_count,
         )
 
     def _get_session_db_for_recall(self):

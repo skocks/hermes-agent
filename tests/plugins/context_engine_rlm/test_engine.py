@@ -2197,3 +2197,99 @@ def test_repl_retrieval_spans_the_full_rotation_chain(tmp_path, _cleanup_repl):
         "own 1 new one -- the full conversation, not just what archived "
         "under session-B's own id"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-22: provenance instead of similarity. Round 21's rotation detection
+# was compensating for the wrong root cause -- background review forks
+# (agent/background_review.py's _spawn_background_review) construct their
+# own AIAgent, on_session_start binds a fresh id, and RLM archived the
+# FULL inherited parent transcript it was handed to review as if it were
+# the fork's own conversation. Measured: 505 of 1,062 real archive rows
+# (47%) were background agents re-archiving the user's own conversation.
+# Fix: the host now tells the engine directly (agent_kind,
+# inherited_message_count), no content comparison needed.
+# ---------------------------------------------------------------------------
+
+def test_on_session_start_seeds_persisted_count_from_inherited_count(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine.on_session_start(
+        "review-fork-1", agent_kind="background_review",
+        parent_session_id="parent-session", inherited_message_count=42,
+    )
+    assert engine._persisted_count == 42
+    assert engine._resume_verified is True
+    assert engine._rotation_checked is True, (
+        "provenance already answers the question rotation detection exists "
+        "to answer -- it must not also run for a provenance-seeded session"
+    )
+    assert engine._agent_kind == "background_review"
+    assert engine._parent_session_id == "parent-session"
+
+
+def test_provenance_seeding_ignored_for_ordinary_conversation_sessions(tmp_path):
+    """agent_kind='conversation' (the default -- an ordinary user session)
+    must never have its persisted_count overridden by a stray
+    inherited_message_count, even if one were somehow passed.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("normal-session", inherited_message_count=42)
+    assert engine._persisted_count == 0
+    assert engine._agent_kind == "conversation"
+
+
+def test_background_review_archives_only_its_own_generated_content(tmp_path):
+    """End-to-end: the actual point. A background review fork handed the
+    parent's full transcript must archive only what it generates itself,
+    not the inherited transcript a second time.
+    """
+    engine = _make_engine(tmp_path)
+    parent_transcript = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"parent msg {i}"}
+        for i in range(20)
+    ]
+    engine.on_session_start(
+        "review-fork-2", agent_kind="background_review",
+        parent_session_id="parent-session-2",
+        inherited_message_count=len(parent_transcript),
+    )
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    # The fork's own conversation = inherited transcript + its own turns.
+    fork_conversation = parent_transcript + [
+        {"role": "user", "content": "review prompt"},
+        {"role": "assistant", "content": "updated skill X"},
+    ]
+    engine.on_turn_complete(fork_conversation, turn_id=1)
+
+    assert engine._store.message_count("review-fork-2") == 2, (
+        "only the fork's own 2 new messages should archive -- not the 20 "
+        "inherited from the parent, which are already archived under the "
+        "parent's own session_id"
+    )
+
+
+def test_background_review_does_not_pollute_parent_archive(tmp_path):
+    """The inherited content isn't just skipped for the fork -- it must
+    not leak into or duplicate the parent's own archive either (the fork
+    and the parent are archived under different session_ids throughout).
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("parent-session-3")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    parent_transcript = [{"role": "user", "content": f"parent msg {i}"} for i in range(10)]
+    engine.on_turn_complete(parent_transcript, turn_id=1)
+    assert engine._store.message_count("parent-session-3") == 10
+
+    engine.on_session_start(
+        "review-fork-3", agent_kind="background_review",
+        parent_session_id="parent-session-3",
+        inherited_message_count=len(parent_transcript),
+    )
+    fork_conversation = parent_transcript + [{"role": "assistant", "content": "review done"}]
+    engine.on_turn_complete(fork_conversation, turn_id=1)
+
+    assert engine._store.message_count("parent-session-3") == 10, (
+        "the parent's own archive must be untouched by the fork's activity"
+    )
+    assert engine._store.message_count("review-fork-3") == 1

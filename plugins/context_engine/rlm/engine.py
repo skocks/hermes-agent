@@ -338,6 +338,11 @@ class RLMContextEngine(ContextEngine):
         # visible, same reasoning as _resume_verified above). Reset on
         # session start/reset since it's a per-session decision.
         self._rotation_checked: bool = True  # True until on_session_start sets it False
+        # Round-22: host-provided provenance, set by on_session_start's
+        # kwargs when known. Defaults here matter for is_available()/etc.
+        # being called before any session has started.
+        self._agent_kind: str = "conversation"
+        self._parent_session_id: Optional[str] = None
         self._store: Optional[RLMStore] = None
         self._store_error: Optional[str] = None
         self._runtime: Dict[str, str] = {}  # captured in update_model(), used to spawn the REPL
@@ -1227,6 +1232,18 @@ class RLMContextEngine(ContextEngine):
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or "unknown"
+        # Round-22: provenance from the host, not inferred from content.
+        # agent_init.py now forwards these when they're known (background
+        # review forks, delegate_task subagents) -- see engine.py's module
+        # docstring update and round-22's report for why content-based
+        # inference (round 21's rotation detection) was the wrong lever:
+        # a background review fork is HANDED the full parent conversation
+        # to review, so its content trivially "looks like" a continuation
+        # of the parent even though it structurally never was one -- the
+        # host already knows the real relationship, no need to guess it
+        # back from bytes.
+        self._agent_kind: str = str(kwargs.get("agent_kind") or "conversation")
+        self._parent_session_id: Optional[str] = kwargs.get("parent_session_id") or None
         # Self-healing: hermes-agent reuses ONE engine instance across /new
         # (cli.py calls on_session_end at that boundary, then rebinds this
         # same instance to the new session — it does not construct a fresh
@@ -1268,6 +1285,37 @@ class RLMContextEngine(ContextEngine):
                 self._trigger_resync()
                 self._resume_verified = True
                 self._rotation_checked = False  # _trigger_resync just zeroed persisted_count too
+            # Round-22: a background/subagent construction that inherited
+            # a parent transcript tells us exactly how much of it is NOT
+            # this session's own content -- seed persisted_count from that
+            # host-provided fact instead of the message_count() guess
+            # above (which is correctly 0 for a brand-new id and would
+            # otherwise archive the WHOLE inherited transcript as if this
+            # session generated it). Same idea as M6's watermark, but the
+            # value comes from the host, not a content scan, so it's
+            # trusted outright -- no verification pass needed, and this
+            # deliberately overrides whatever the try/except above just
+            # computed, including a _trigger_resync() reset, since a
+            # host-provided fact is more reliable than either.
+            _inherited = kwargs.get("inherited_message_count")
+            if self._agent_kind != "conversation" and isinstance(_inherited, int) and _inherited > 0:
+                self._persisted_count = _inherited
+                self._resume_verified = True
+                # Provenance already answers "is this a continuation of
+                # something else" -- round 21's content-based rotation
+                # heuristic exists for sessions provenance says nothing
+                # about, not this one. persisted_count != 0 would make it
+                # skip on its own anyway (see its own gate), set
+                # explicitly here for clarity, not because it's load-bearing.
+                self._rotation_checked = True
+                logger.info(
+                    "RLM: session=%s (agent_kind=%s, parent=%s) seeded "
+                    "persisted_count=%d from host-provided inherited "
+                    "transcript length -- archiving only what this "
+                    "session generates, not re-archiving the parent's",
+                    self._session_id, self._agent_kind, self._parent_session_id,
+                    _inherited,
+                )
             # Round-9: throttled internally (rlm_meta, not this call site),
             # so calling it on every on_session_start -- including every
             # /new, since this engine instance is reused rather than

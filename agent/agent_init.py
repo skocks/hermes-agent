@@ -568,6 +568,8 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    agent_kind: str = "conversation",
+    inherited_message_count: int = 0,
 ):
     """
     Initialize the AI Agent.
@@ -1663,6 +1665,10 @@ def init_agent(
     # _get_session_db_for_recall, where nothing else holds a reference.
     agent._owns_session_db = False
     agent._parent_session_id = parent_session_id
+    # Round-22: provenance for context-engine plugins -- see run_agent.py's
+    # AIAgent.__init__ docstring comment for the full rationale.
+    agent._agent_kind = agent_kind
+    agent._inherited_message_count = inherited_message_count
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
     # sequence must be serialized per agent rather than relying on SQLite alone.
@@ -2797,6 +2803,15 @@ def init_agent(
                 model=agent.model,
                 context_length=getattr(agent.context_compressor, "context_length", 0),
                 conversation_id=getattr(agent, "_gateway_session_key", None),
+                # Round-22: provenance, same shape the compression path
+                # already uses for boundary_reason/old_session_id -- lets
+                # a plugin distinguish "a real, user-facing session" from
+                # "a construction that inherited another session's
+                # transcript for a different purpose" without inferring
+                # it from content.
+                parent_session_id=parent_session_id,
+                agent_kind=agent_kind,
+                inherited_message_count=inherited_message_count,
             )
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)

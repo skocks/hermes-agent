@@ -1959,6 +1959,17 @@ def _build_child_agent(
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,
                 parent_session_id=getattr(parent_agent, "session_id", None),
+                # Round-22: provenance for the context engine. Unlike a
+                # background review fork, a delegate_task child does NOT
+                # inherit the parent's transcript (its own schema says so:
+                # "the subagent knows nothing about your conversation
+                # history") -- it gets its own real session_id, registers
+                # its own state.db row (source='subagent'), and starts
+                # from an empty conversation_history, so there is nothing
+                # to seed inherited_message_count from and it's left at
+                # its 0 default. agent_kind is set anyway for the
+                # bookkeeping this round doesn't act on yet (item 3).
+                agent_kind="subagent",
                 providers_allowed=child_providers_allowed,
                 providers_ignored=child_providers_ignored,
                 providers_order=child_providers_order,

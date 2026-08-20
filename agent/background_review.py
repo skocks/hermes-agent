@@ -955,6 +955,19 @@ def _run_review_in_thread(
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent, task_cfg)
             _routed = bool(_rt.get("routed"))
+            # Round-22: computed here (moved up from just before
+            # run_conversation() below) so its length is known at
+            # construction time -- passed to AIAgent as
+            # inherited_message_count, forwarded to the context engine's
+            # on_session_start so it archives only what THIS agent
+            # generates, not the parent conversation it was handed to
+            # review. Routed to a different model -> replay a digest
+            # (cache is cold on that model anyway); same model -> replay
+            # the full snapshot (warm cache reads) -- unchanged logic,
+            # just relocated.
+            _review_history = (
+                _digest_history(messages_snapshot) if _routed else messages_snapshot
+            )
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -1046,6 +1059,12 @@ def _run_review_in_thread(
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                # Round-22: this fork is HANDED the parent's conversation
+                # to review, which is structurally different from
+                # continuing it -- provenance for the context engine
+                # (see run_agent.py's AIAgent.__init__ docstring comment).
+                agent_kind="background_review",
+                inherited_message_count=len(_review_history),
                 **_fork_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
@@ -1187,12 +1206,9 @@ def _run_review_in_thread(
                 pass
 
             try:
-                # Routed to a different model -> replay a digest (cache is cold
-                # on that model anyway, so minimise cold-written tokens). Same
-                # model -> replay the full snapshot (warm cache reads).
-                _review_history = (
-                    _digest_history(messages_snapshot) if _routed else messages_snapshot
-                )
+                # _review_history computed earlier now (round 22, see the
+                # AIAgent construction above) -- same value, no longer
+                # recomputed here.
                 review_agent.run_conversation(
                     user_message=(
                         prompt + "\n\nYou can only call memory and skill "
