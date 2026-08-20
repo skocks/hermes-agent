@@ -9639,7 +9639,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     self.agent._session_db_created = True
                 except Exception:
-                    pass
+                    # Round-20: was a bare `pass` -- a create_session()
+                    # failure (state.db write-lock contention exhausting
+                    # even _insert_session_row's 60s jittered retry, or any
+                    # other error) left this session invisible to state.db
+                    # forever with zero trace anywhere. Must stay a swallow
+                    # (a registration failure can't be allowed to crash
+                    # session start -- self.agent._session_db_created is
+                    # already False here and every downstream self-healing
+                    # path, e.g. update_token_counts's own INSERT OR IGNORE,
+                    # is built to tolerate that), but silence is the actual
+                    # bug: this is the only place that would ever have
+                    # surfaced "this session has no durable record" to
+                    # anyone. Logged, not raised.
+                    logger.warning(
+                        "create_session failed for session_id=%s -- this "
+                        "session will not have a state.db row until a "
+                        "later self-healing write (e.g. update_token_counts) "
+                        "succeeds; if none ever does, this session is "
+                        "durably invisible to state.db",
+                        self.session_id, exc_info=True,
+                    )
                 if title and self._session_db:
                     from hermes_state import SessionDB
                     try:

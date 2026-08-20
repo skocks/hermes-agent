@@ -972,11 +972,41 @@ def _make_state_db(tmp_path, session_ids):
     return path
 
 
+def _remove_from_state_db(state_db_path, session_id):
+    """Simulate a session that WAS registered and has since been pruned/
+    removed from state.db -- as distinct from one that was never
+    registered at all (round 20's whole distinction)."""
+    import sqlite3
+    conn = sqlite3.connect(state_db_path)
+    conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+
+def _add_to_state_db(state_db_path, session_id):
+    """Insert into an ALREADY-CREATED state.db stand-in (see
+    _make_state_db) -- for tests that need to add a session after the
+    fact rather than seed it up front."""
+    import sqlite3
+    conn = sqlite3.connect(state_db_path)
+    conn.execute("INSERT INTO sessions (id, started_at) VALUES (?, 0)", (session_id,))
+    conn.commit()
+    conn.close()
+
+
 def test_sweep_deletes_orphaned_session_rows_and_fts_entries(tmp_path):
-    """A session_id present in rlm.db but absent from state.db is an
-    orphan: its rows -- live AND tombstoned -- and its FTS5 entries are
-    all removed. This is a real DELETE, unlike supersede_session's
-    tombstone -- by design, this is rlm.db's only deletion path.
+    """A session_id CONFIRMED PRESENT in state.db at some point and later
+    absent is an orphan: its rows -- live AND tombstoned -- and its FTS5
+    entries are all removed. This is a real DELETE, unlike
+    supersede_session's tombstone -- by design, this is rlm.db's only
+    deletion path.
+
+    Round 20: two-phase fixture now, not one -- absence alone no longer
+    authorises deletion (see test_sweep_never_deletes_a_session_never_seen_
+    present below for that exact guard). This test must first let the
+    sweep CONFIRM the session present, then remove it from state.db, to
+    exercise the actual "was seen, now gone" deletion path rather than
+    accidentally re-testing the old (buggy) "absent from the start" case.
     """
     from plugins.context_engine.rlm.store import RLMStore
     store = RLMStore(str(tmp_path / "rlm.db"))
@@ -987,7 +1017,12 @@ def test_sweep_deletes_orphaned_session_rows_and_fts_entries(tmp_path):
     store.append_messages("orphan", 3, [{"role": "user", "content": "swept too"}])
     assert store.raw_row_count("orphan") == 3
 
-    state_db = _make_state_db(tmp_path, [])  # state.db knows nothing of "orphan"
+    state_db = _make_state_db(tmp_path, ["orphan"])  # present -- gets confirmed-seen
+    first = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+    assert first["sessions_pruned"] == 0, "still present -- must not be swept yet"
+    assert store.raw_row_count("orphan") == 3
+
+    _remove_from_state_db(state_db, "orphan")  # now genuinely released
     result = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
 
     assert result["sessions_pruned"] == 1
@@ -1070,7 +1105,10 @@ def test_sweep_throttled_by_min_interval_hours(tmp_path):
     from plugins.context_engine.rlm.store import RLMStore
     store = RLMStore(str(tmp_path / "rlm.db"))
     store.append_messages("orphan", 1, [{"role": "user", "content": "x"}])
-    state_db = _make_state_db(tmp_path, [])
+    state_db = _make_state_db(tmp_path, ["orphan"])
+    store.sweep_orphaned_sessions(state_db, min_interval_hours=0)  # confirm-seen pass
+    _remove_from_state_db(state_db, "orphan")
+    store.set_meta("last_orphan_sweep", "0")  # simulate time passing since the confirm pass
 
     first = store.sweep_orphaned_sessions(state_db, min_interval_hours=24)
     assert first["skipped"] is False
@@ -1094,6 +1132,9 @@ def test_sweep_vacuum_gated_by_deleted_rows_and_min_vacuum_interval(tmp_path):
     assert r1["vacuumed"] is False
 
     store.append_messages("orphan", 1, [{"role": "user", "content": "x"}])
+    _add_to_state_db(state_db, "orphan")  # now present
+    store.sweep_orphaned_sessions(state_db, min_interval_hours=0)  # confirm-seen pass
+    _remove_from_state_db(state_db, "orphan")
     r2 = store.sweep_orphaned_sessions(
         state_db, min_interval_hours=0, vacuum_after_prune=True, min_vacuum_interval_days=30
     )
@@ -1101,11 +1142,87 @@ def test_sweep_vacuum_gated_by_deleted_rows_and_min_vacuum_interval(tmp_path):
     assert r2["vacuumed"] is True
 
     store.append_messages("orphan2", 1, [{"role": "user", "content": "y"}])
+    _add_to_state_db(state_db, "orphan2")
+    store.sweep_orphaned_sessions(state_db, min_interval_hours=0)  # confirm-seen pass
+    _remove_from_state_db(state_db, "orphan2")
     r3 = store.sweep_orphaned_sessions(
         state_db, min_interval_hours=0, vacuum_after_prune=True, min_vacuum_interval_days=30
     )
     assert r3["sessions_pruned"] == 1
     assert r3["vacuumed"] is False, "min_vacuum_interval_days must throttle even with fresh deletes"
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Round-20: absence from state.db alone stopped being sufficient grounds
+# for deletion -- it deleted the only surviving copy of a real ~1.4MB user
+# conversation whose create_session() had silently failed under write
+# contention. A session_id is now only ever a sweep candidate once it has
+# been positively confirmed present in state.db at least once.
+# ---------------------------------------------------------------------------
+
+def test_sweep_never_deletes_a_session_never_seen_present(tmp_path):
+    """THE invariant this round exists for: a session absent from
+    state.db from the very first sweep it's ever checked in -- exactly
+    the create_session()-silently-failed shape -- must never be deleted,
+    no matter how many sweeps run or how much time passes. No age-based
+    escape hatch either: run several sweeps, still not deleted.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("never-registered", 1, [{"role": "user", "content": "real conversation"}])
+    state_db = _make_state_db(tmp_path, [])  # never present, not even once
+
+    for _ in range(3):
+        result = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+        assert result["sessions_pruned"] == 0
+        assert store.raw_row_count("never-registered") == 1
+
+    hits = store.search_any("never-registered", ["conversation"])
+    assert len(hits) == 1, "content must still be fully intact and findable, not just uncounted"
+    store.close()
+
+
+def test_sweep_still_deletes_a_session_confirmed_then_genuinely_released(tmp_path):
+    """The other half of the invariant: retention must keep working for
+    the real case -- a session that WAS registered and later legitimately
+    aged out of state.db (round 9's original design intent) is still
+    swept, not permanently grandfathered in by having existed once.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("released", 1, [{"role": "user", "content": "old conversation"}])
+    state_db = _make_state_db(tmp_path, ["released"])
+
+    confirm = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+    assert confirm["sessions_pruned"] == 0, "present -- confirmed seen, not swept yet"
+
+    _remove_from_state_db(state_db, "released")  # state.db's own retention released it
+    result = store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+
+    assert result["sessions_pruned"] == 1
+    assert store.raw_row_count("released") == 0
+
+
+def test_seen_sessions_record_cleaned_up_after_deletion(tmp_path):
+    """rlm_seen_sessions must not grow unboundedly with dead entries --
+    a swept session's seen-record is removed in the same pass, not left
+    behind as permanent evidence for a session_id that no longer exists
+    anywhere.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("s1", 1, [{"role": "user", "content": "x"}])
+    state_db = _make_state_db(tmp_path, ["s1"])
+    store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+    assert store._filter_seen_sessions({"s1"}) == {"s1"}
+
+    _remove_from_state_db(state_db, "s1")
+    store.sweep_orphaned_sessions(state_db, min_interval_hours=0)
+
+    assert store._filter_seen_sessions({"s1"}) == set(), (
+        "the seen-record must be cleaned up once its session is actually deleted"
+    )
     store.close()
 
 

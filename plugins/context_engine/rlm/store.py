@@ -64,7 +64,27 @@ CREATE TABLE IF NOT EXISTS rlm_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS rlm_seen_sessions (
+    session_id       TEXT PRIMARY KEY,
+    first_confirmed_ts REAL NOT NULL
+);
 """
+# rlm_seen_sessions -- round 20. Positive evidence a session_id was
+# actually confirmed present in state.db at some point, not just "we
+# have RLM archive rows for it". See sweep_orphaned_sessions's own
+# docstring for why absence alone stopped being sufficient grounds for
+# deletion: create_session() can silently fail (a pre-existing,
+# documented hermes_state.py failure mode under write contention), so a
+# session state.db never registered looks IDENTICAL to a session that
+# was registered and later pruned -- "not in state.db" conflated "never
+# existed here" with "existed and was released". A real user session
+# lost this way had ~1.4MB of conversation whose ONLY surviving copy was
+# this store, one sweep away from deletion. Now: a session_id is only
+# ever eligible for the sweep once it has been POSITIVELY seen present
+# in state.db at least once; a session_id absent from state.db that was
+# never recorded here is left alone indefinitely, not swept "eventually"
+# under some age rule -- because the failure mode being guarded against
+# (create_session never succeeding) does not resolve itself with time.
 # idx_rlm_session_superseded deliberately NOT in _SCHEMA above: on an
 # existing (pre-N2) database the table already exists, so CREATE TABLE IF
 # NOT EXISTS is a no-op and the superseded column doesn't exist yet --
@@ -426,11 +446,29 @@ class RLMStore:
         min_vacuum_interval_days: int = 30,
     ) -> Dict[str, Any]:
         """Delete every RLM row (live and tombstoned alike) for a session
-        that no longer exists in state.db's `sessions` table. This is the
-        ONLY deletion path rlm.db has, and it deliberately has no clock or
-        config of its own -- see the module docstring. state.db is asked
-        "does this session still exist", never "how old is it"; RLM has no
-        opinion on age, only on presence.
+        that WAS confirmed present in state.db's `sessions` table at some
+        point and no longer is. This is the ONLY deletion path rlm.db has,
+        and it deliberately has no clock or config of its own -- see the
+        module docstring.
+
+        Round 20: absence from state.db alone is NOT sufficient grounds
+        for deletion anymore -- it used to be, and it deleted the only
+        surviving copy of a real ~1.4MB user conversation whose
+        create_session() had silently failed under write contention (a
+        pre-existing, documented hermes_state.py failure mode). Absence
+        can mean "existed and was released" (the intended case) or "never
+        successfully registered in the first place" (the bug), and
+        state.db cannot tell those apart after the fact -- there's no
+        tombstone on ITS side. So this now requires POSITIVE evidence:
+        every session currently found present in state.db is recorded
+        into rlm_seen_sessions (a session_id is only ever a deletion
+        candidate here once it's been seen present at least once), and
+        the sweep target is `previously seen AND absent now` -- not just
+        `absent now`. A session_id absent from state.db that was never
+        recorded here is left alone indefinitely: the failure mode this
+        guards against (registration never succeeding) doesn't resolve
+        with age, so there is deliberately no age-based escape hatch
+        either.
 
         Fail-open, same posture as select_context()'s "can't archive ->
         don't drop" rule: state.db unreadable, the query failing, or
@@ -487,7 +525,24 @@ class RLMStore:
             # whole sweep -- never treat "couldn't check state.db" as
             # "state.db has nothing", which would delete everything.
             existing = self._existing_state_db_sessions(state_db_path, candidates)
-            orphans = candidates - existing
+            # Round 20: record positive evidence BEFORE computing orphans,
+            # so a session present right now is provably eligible for a
+            # future sweep once it later disappears -- and so this sweep's
+            # own orphan check below can require that evidence rather than
+            # trusting bare absence.
+            self._record_seen_sessions(existing)
+            absent_now = candidates - existing
+            previously_confirmed = self._filter_seen_sessions(absent_now)
+            orphans = absent_now & previously_confirmed
+            never_confirmed = absent_now - previously_confirmed
+            if never_confirmed:
+                logger.info(
+                    "RLM: orphan sweep left %d session(s) untouched -- "
+                    "absent from state.db but never confirmed present "
+                    "there, so absence isn't trusted as proof of release "
+                    "(round-20 guard)",
+                    len(never_confirmed),
+                )
             if not orphans:
                 self.set_meta("last_orphan_sweep", str(now))
                 return result
@@ -509,6 +564,11 @@ class RLMStore:
                         self._conn.execute(
                             f"DELETE FROM rlm_search WHERE session_id IN ({placeholders})", batch
                         )
+                    # The seen-evidence row is now moot -- the session it
+                    # was evidence for no longer exists in either db.
+                    self._conn.execute(
+                        f"DELETE FROM rlm_seen_sessions WHERE session_id IN ({placeholders})", batch
+                    )
                 self._conn.commit()
 
             result["sessions_pruned"] = len(orphans)
@@ -563,6 +623,45 @@ class RLMStore:
             return found
         finally:
             conn.close()
+
+    def _record_seen_sessions(self, session_ids: set) -> None:
+        """Round 20: persist positive evidence a session_id was confirmed
+        present in state.db. INSERT OR IGNORE -- first confirmation wins,
+        never overwritten (this is a "was it ever seen" record, not a
+        "when was it last seen" one; the first sighting is all the
+        deletion decision needs).
+        """
+        if not session_ids:
+            return
+        now = time.time()
+        rows = [(sid, now) for sid in session_ids]
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO rlm_seen_sessions (session_id, first_confirmed_ts) "
+                "VALUES (?, ?)",
+                rows,
+            )
+            self._conn.commit()
+
+    def _filter_seen_sessions(self, session_ids: set) -> set:
+        """Which of `session_ids` have a rlm_seen_sessions record -- i.e.
+        were confirmed present in state.db at some prior point, whether or
+        not they still are now.
+        """
+        if not session_ids:
+            return set()
+        found: set = set()
+        session_ids = list(session_ids)
+        with self._lock:
+            for i in range(0, len(session_ids), 500):
+                batch = session_ids[i : i + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = self._conn.execute(
+                    f"SELECT session_id FROM rlm_seen_sessions WHERE session_id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                found.update(r[0] for r in rows)
+        return found
 
     def close(self) -> None:
         with self._lock:
