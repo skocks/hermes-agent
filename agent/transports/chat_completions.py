@@ -534,6 +534,7 @@ class ChatCompletionsTransport(ProviderTransport):
         anthropic_max_out = params.get("anthropic_max_output")
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
+        is_nous = params.get("is_nous", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
 
         if ephemeral is not None and max_tokens_fn:
