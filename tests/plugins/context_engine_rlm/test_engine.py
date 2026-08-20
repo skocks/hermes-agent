@@ -2078,3 +2078,122 @@ def test_prune_tool_results_only_noop_below_threshold(tmp_path):
     pruned, count = engine.prune_tool_results_only(messages)
     assert count == 0
     assert pruned is messages, "no-op contract: must hand back the SAME object when nothing qualifies"
+
+
+# ---------------------------------------------------------------------------
+# Round-21 item 1: rotation-aware archiving. A gateway restart mints a
+# fresh session_id but restores the same conversation; archiving used to
+# treat that as brand new and re-archive the whole restored transcript
+# from zero -- traced as the upstream cause of the duplication N2's
+# tombstoning was invented to clean up, never traced to its source until
+# now. One real pair shared 59 of 61 distinct messages, one genuinely new.
+# ---------------------------------------------------------------------------
+
+def test_detect_rotation_predecessor_finds_a_real_continuation(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    old = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"old msg {i}"} for i in range(10)]
+    store.append_messages("session-A", 1, old)
+
+    # session-B's opening transcript = session-A's full content restored,
+    # plus one genuinely new message after the restart.
+    restored = old + [{"role": "user", "content": "one new message after restart"}]
+    predecessor = store.detect_rotation_predecessor("session-B", restored)
+    assert predecessor == "session-A"
+    store.close()
+
+
+def test_detect_rotation_predecessor_none_when_no_match(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("session-A", 1, [{"role": "user", "content": f"unrelated {i}"} for i in range(10)])
+
+    genuinely_new = [{"role": "user", "content": f"brand new topic {i}"} for i in range(5)]
+    assert store.detect_rotation_predecessor("session-B", genuinely_new) is None
+    store.close()
+
+
+def test_detect_rotation_predecessor_none_when_ambiguous(tmp_path):
+    """Two different sessions coincidentally share the same last message
+    -- must not guess, a wrong link is worse than a missed one.
+    """
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    shared_tail = [{"role": "user", "content": f"m{i}"} for i in range(5)]
+    store.append_messages("session-A", 1, shared_tail)
+    store.append_messages("session-C", 1, shared_tail)  # same content, different session
+
+    restored = shared_tail + [{"role": "user", "content": "new"}]
+    assert store.detect_rotation_predecessor("session-B", restored) is None
+    store.close()
+
+
+def test_detect_rotation_predecessor_none_for_trivial_opening(tmp_path):
+    from plugins.context_engine.rlm.store import RLMStore
+    store = RLMStore(str(tmp_path / "rlm.db"))
+    store.append_messages("session-A", 1, [{"role": "user", "content": "hi"}])
+    assert store.detect_rotation_predecessor("session-B", [{"role": "user", "content": "hi"}]) is None
+    store.close()
+
+
+def test_archive_new_links_rotation_and_archives_only_the_new_tail(tmp_path):
+    """End-to-end through the engine: session A's content must not be
+    re-archived under session B -- only the genuinely new message.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("session-A")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    old = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"old msg {i}"} for i in range(10)]
+    engine.on_turn_complete(old, turn_id=1)
+    assert engine._store.message_count("session-A") == 10
+
+    engine.on_session_start("session-B")  # same engine instance, reused across /new-like transitions
+    restored = old + [{"role": "user", "content": "one new message after restart"}]
+    engine.on_turn_complete(restored, turn_id=1)
+
+    assert engine._store.message_count("session-B") == 1, (
+        "only the genuinely new message should archive under the new id -- "
+        "the restored 10 already exist under session-A"
+    )
+    assert engine._store.resolve_rotation_chain("session-B") == ["session-B", "session-A"]
+
+
+def test_rotation_does_not_link_a_genuinely_new_session(tmp_path):
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("session-A")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    engine.on_turn_complete([{"role": "user", "content": f"old {i}"} for i in range(10)], turn_id=1)
+
+    engine.on_session_start("session-C")
+    genuinely_new = [{"role": "user", "content": f"totally unrelated {i}"} for i in range(5)]
+    engine.on_turn_complete(genuinely_new, turn_id=1)
+
+    assert engine._store.message_count("session-C") == 5, "must archive normally, nothing to link"
+    assert engine._store.resolve_rotation_chain("session-C") == ["session-C"]
+
+
+def test_repl_retrieval_spans_the_full_rotation_chain(tmp_path, _cleanup_repl):
+    """The actual point of item 1: the model's retrieval must reach the
+    whole conversation regardless of which session_id its REPL instance
+    is running under.
+    """
+    engine = _make_engine(tmp_path)
+    engine.on_session_start("session-A")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+    old = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"old msg {i}"} for i in range(10)]
+    engine.on_turn_complete(old, turn_id=1)
+
+    engine.on_session_start("session-B")
+    restored = old + [{"role": "user", "content": "one new message after restart"}]
+    engine.on_turn_complete(restored, turn_id=1)
+
+    repl = PersistentREPL(
+        db_path=engine._store.db_path, session_id="session-B", base_url="http://x/v1", model="m"
+    )
+    _cleanup_repl.append(repl)
+    r = repl.exec("print(context_total)")
+    assert r["stdout"].strip() == "11", (
+        "session-B's REPL must see all 10 of session-A's messages plus its "
+        "own 1 new one -- the full conversation, not just what archived "
+        "under session-B's own id"
+    )

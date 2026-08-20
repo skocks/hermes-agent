@@ -332,6 +332,12 @@ class RLMContextEngine(ContextEngine):
         # _archive_new() call after a resume (the earliest point the live
         # transcript is actually visible); until then, treated as unverified.
         self._resume_verified: bool = True  # True until on_session_start sets it False
+        # Round-21: whether rotation-detection has run for the CURRENT
+        # session yet -- at most once per session, on the first real
+        # _archive_new() call (the earliest point the live transcript is
+        # visible, same reasoning as _resume_verified above). Reset on
+        # session start/reset since it's a per-session decision.
+        self._rotation_checked: bool = True  # True until on_session_start sets it False
         self._store: Optional[RLMStore] = None
         self._store_error: Optional[str] = None
         self._runtime: Dict[str, str] = {}  # captured in update_model(), used to spawn the REPL
@@ -1042,6 +1048,10 @@ class RLMContextEngine(ContextEngine):
                 self._session_id, len(messages), self._persisted_count,
             )
             self._trigger_resync()
+        if not self._rotation_checked:
+            self._rotation_checked = True  # at most once per session, regardless of outcome
+            if self._persisted_count == 0:
+                self._maybe_link_rotation(messages)
         new_messages = messages[self._persisted_count :]
         if not new_messages:
             return
@@ -1093,6 +1103,43 @@ class RLMContextEngine(ContextEngine):
             logger.exception(
                 "RLM: failed to archive %d message(s) for session=%s",
                 len(new_messages), self._session_id,
+            )
+
+    def _maybe_link_rotation(self, messages: List[Dict[str, Any]]) -> None:
+        """Round-21: is this brand-new session actually a gateway-restart
+        continuation of a different session's archive, not a genuinely
+        new conversation? See store.py's rlm_session_rotation module
+        comment for the full mechanism and why a link (not a rewrite) was
+        chosen. Called at most once per session, only when
+        _persisted_count is still 0 (see the call site).
+
+        On a confirmed match: records the link (so repl.py's retrieval
+        spans the whole conversation regardless of which session_id it's
+        running under) and seeds _persisted_count from the predecessor's
+        own message_count() -- so the caller's normal
+        `messages[_persisted_count:]` slice archives only the genuinely
+        NEW tail under this session's id, not a full duplicate of
+        everything the predecessor already has. Never raises: a detection
+        failure just means "treat this as a genuinely new session",
+        exactly like not finding a match at all.
+        """
+        try:
+            predecessor = self._store.detect_rotation_predecessor(self._session_id, messages)
+            if not predecessor:
+                return
+            self._store.record_rotation(self._session_id, predecessor)
+            self._persisted_count = self._store.message_count(predecessor)
+            logger.info(
+                "RLM: session=%s detected as a rotation of session=%s "
+                "(gateway restart continuation) -- seeded persisted_count=%d "
+                "so only genuinely new content archives under the new id",
+                self._session_id, predecessor, self._persisted_count,
+            )
+        except Exception:
+            logger.exception(
+                "RLM: rotation detection failed for session=%s -- treating "
+                "as a genuinely new session",
+                self._session_id,
             )
 
     def _trigger_resync(self) -> None:
@@ -1200,6 +1247,14 @@ class RLMContextEngine(ContextEngine):
                 # than trusting it blindly for the rest of the session.
                 self._persisted_count = self._store.message_count(self._session_id)
                 self._resume_verified = self._persisted_count == 0  # nothing to verify against
+                # Round-21: rotation only makes sense for a session with NO
+                # archive of its own yet (persisted_count == 0) -- a
+                # resumed session that already has its own rows isn't the
+                # "gateway restart minted a fresh id" case, it's the
+                # ordinary resume case M6 already handles. False here means
+                # "check on the first real _archive_new() call"; True
+                # (nothing to do) for a session that isn't actually fresh.
+                self._rotation_checked = self._persisted_count != 0
             except Exception:
                 logger.exception("RLM: message_count lookup failed on session start")
                 # Round-5 review: same counterexample as the check_n<=0
@@ -1212,6 +1267,7 @@ class RLMContextEngine(ContextEngine):
                 # safe default regardless.
                 self._trigger_resync()
                 self._resume_verified = True
+                self._rotation_checked = False  # _trigger_resync just zeroed persisted_count too
             # Round-9: throttled internally (rlm_meta, not this call site),
             # so calling it on every on_session_start -- including every
             # /new, since this engine instance is reused rather than
@@ -1269,6 +1325,7 @@ class RLMContextEngine(ContextEngine):
         super().on_session_reset()
         self._persisted_count = 0
         self._resume_verified = True  # count is 0, nothing to verify
+        self._rotation_checked = False
         self._next_turn_id = 0
         self._auto_recall_cache = None
         self._tail_boundary = 0

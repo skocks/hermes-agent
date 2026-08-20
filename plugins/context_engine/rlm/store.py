@@ -68,7 +68,37 @@ CREATE TABLE IF NOT EXISTS rlm_seen_sessions (
     session_id       TEXT PRIMARY KEY,
     first_confirmed_ts REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rlm_session_rotation (
+    session_id    TEXT PRIMARY KEY,
+    rotated_from  TEXT NOT NULL,
+    detected_ts   REAL NOT NULL
+);
 """
+# rlm_session_rotation -- round 21. Records "session_id continues
+# rotated_from" -- a gateway restart mints a fresh session_id but
+# restores the SAME conversation, and archiving used to treat that as a
+# brand-new session, re-archiving the whole restored transcript from
+# zero under the new id. Traced as the upstream cause of exactly the
+# duplication N2's tombstoning was invented to clean up in round 5,
+# never traced back to its source until now: three real conversations
+# that night were recorded as thirteen session_ids, one pair sharing 59
+# of 61 distinct messages -- one genuinely new message, the rest a full
+# re-archive of the same content under a new identity.
+#
+# A link, not a rewrite: detect_rotation_predecessor() finds the
+# predecessor: chosen over rewriting existing rows' session_id, which
+# would touch round 9's tombstone accounting, round 18's
+# supersede_reproduced_rows content-matching, and round 20's seen-table
+# keys, all of which already work correctly per-session_id and don't
+# need to know about rotation at all. Retrieval (repl.py's
+# _session_id_chain()) resolves the full chain and queries across every
+# session_id in it, so the model's history()/context reach the whole
+# conversation regardless of which id its REPL instance is running
+# under. archive_new() also seeds the new session's _persisted_count
+# from its predecessor's message_count() once a rotation is confirmed,
+# so only the genuinely NEW tail (whatever the model said after the
+# restart) gets archived under the new id -- not the whole restored
+# conversation a second time.
 # rlm_seen_sessions -- round 20. Positive evidence a session_id was
 # actually confirmed present in state.db at some point, not just "we
 # have RLM archive rows for it". See sweep_orphaned_sessions's own
@@ -662,6 +692,110 @@ class RLMStore:
                 ).fetchall()
                 found.update(r[0] for r in rows)
         return found
+
+    # -- round-21: rotation detection -------------------------------------
+
+    def detect_rotation_predecessor(
+        self, new_session_id: str, opening_messages: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Is `new_session_id`'s opening transcript actually a restored
+        continuation of a DIFFERENT session's archive (a gateway restart
+        minting a fresh id), not a genuinely new conversation?
+
+        The restored transcript is [everything session_id's predecessor
+        already archived] + [zero or more genuinely new messages sent
+        after the restart] -- we don't know that split point in advance,
+        so this walks backward from the very last message, trying each
+        position as the "boundary" (0 new messages, 1 new message, ...,
+        up to 10) as an ANCHOR to look up. For each anchor: (1) its
+        content must match exactly one OTHER session's archive --
+        ambiguous (0 or >1 matches) means try the next position, a wrong
+        link is worse than a missed one; (2) verify a real shared segment
+        around that anchor (up to 10 messages), not a one-message
+        coincidence -- short generic messages ("ok", "thanks") could
+        otherwise false-positive on step 1 alone. Returns on the first
+        position that passes both checks.
+
+        Deliberately does NOT do a full prefix diff of the entire
+        transcript -- the verified segment match is the same trust level
+        M6's own resume-watermark check uses for a much more
+        consequential decision (whether to trust _persisted_count at
+        all), so matching that bar here is consistent, not a shortcut.
+
+        Cost note, accepted not benchmarked: `content = ?` has no index,
+        so each attempted anchor is a full-table scan across every
+        session's archive. Bounded to at most 11 attempts, and gated by
+        the caller to run at most once per NEW session (never per
+        request) -- if this proves too slow on a much larger archive than
+        exists today, the fix is an index or an FTS-based pre-filter, not
+        a redesign of the detection logic itself.
+        """
+        non_system = [m for m in (opening_messages or []) if m.get("role") != "system"]
+        if len(non_system) < 3:
+            return None  # too little signal -- avoid false positives on a trivial opening
+
+        max_new_tail = min(10, len(non_system) - 2)
+        for new_tail_len in range(0, max_new_tail + 1):
+            anchor_idx = len(non_system) - 1 - new_tail_len
+            if anchor_idx < 0:
+                break
+            anchor_content = _stringify(non_system[anchor_idx])
+            with self._lock:
+                candidates = {
+                    r[0]
+                    for r in self._conn.execute(
+                        "SELECT DISTINCT session_id FROM rlm_messages "
+                        "WHERE content = ? AND superseded = 0 AND session_id != ?",
+                        (anchor_content, new_session_id),
+                    ).fetchall()
+                }
+            if len(candidates) != 1:
+                continue
+            candidate = next(iter(candidates))
+            check_n = min(10, anchor_idx + 1)
+            live_segment = [
+                _stringify(m) for m in non_system[anchor_idx - check_n + 1 : anchor_idx + 1]
+            ]
+            archived_tail = self.tail_content(candidate, check_n)
+            if archived_tail == live_segment:
+                return candidate
+        return None
+
+    def record_rotation(self, session_id: str, rotated_from: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO rlm_session_rotation "
+                "(session_id, rotated_from, detected_ts) VALUES (?, ?, ?)",
+                (session_id, rotated_from, time.time()),
+            )
+            self._conn.commit()
+
+    def resolve_rotation_chain(self, session_id: str) -> List[str]:
+        """This session plus every session it's a rotation-continuation
+        of, self first. Engine-side equivalent of repl.py's own
+        _session_id_chain() -- kept as two independent implementations
+        (this one against RLMStore's connection, the REPL child's against
+        its own) rather than shared code, since the child process can't
+        import this module (stdlib-only bootstrap, see repl.py's module
+        docstring) and re-deriving the same small recursive query twice
+        is cheaper than the alternative (passing a resolved chain across
+        the process boundary and keeping it fresh there).
+        """
+        chain = [session_id]
+        seen = {session_id}
+        current = session_id
+        with self._lock:
+            for _ in range(64):
+                row = self._conn.execute(
+                    "SELECT rotated_from FROM rlm_session_rotation WHERE session_id = ?",
+                    (current,),
+                ).fetchone()
+                if not row or not row[0] or row[0] in seen:
+                    break
+                current = row[0]
+                seen.add(current)
+                chain.append(current)
+        return chain
 
     def close(self) -> None:
         with self._lock:

@@ -65,24 +65,61 @@ API_KEY = os.environ.get("RLM_API_KEY", "")
 
 _ns = {{}}
 
+def _session_id_chain():
+    """Round-21: this session plus every session it's a rotation-
+    continuation of (see engine.py's rotation-detection docstring for the
+    mechanism and why it exists -- a gateway restart mints a fresh
+    session_id but restores the same conversation, and archiving used to
+    restart from zero under the new id every time). Walks
+    rlm_session_rotation's rotated_from chain backward from SESSION_ID.
+    Fails safe to just SESSION_ID alone -- an unresolved chain means "see
+    only this session", never an error, and never a wider scope than
+    what's actually linked.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        chain = [SESSION_ID]
+        seen = {{SESSION_ID}}
+        current = SESSION_ID
+        for _ in range(64):  # generous bound against a corrupt/cyclic chain
+            try:
+                row = conn.execute(
+                    "SELECT rotated_from FROM rlm_session_rotation WHERE session_id = ?",
+                    (current,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                break  # table not present (older db) -- just this session
+            if not row or not row[0] or row[0] in seen:
+                break
+            current = row[0]
+            seen.add(current)
+            chain.append(current)
+        return tuple(chain)
+    finally:
+        conn.close()
+
 def _archive_count():
     """COUNT(*), not len(history(limit=big)) -- refreshed every exec() call
     now (see _refresh_context below), so this stays a cheap indexed count
     rather than fetching up to a million rows just to measure them."""
     conn = sqlite3.connect(DB_PATH)
     try:
+        chain = _session_id_chain()
+        placeholders = ",".join("?" * len(chain))
         cur = conn.execute(
-            "SELECT COUNT(*) FROM rlm_messages WHERE session_id = ? AND superseded = 0",
-            (SESSION_ID,),
+            f"SELECT COUNT(*) FROM rlm_messages WHERE session_id IN ({{placeholders}}) AND superseded = 0",
+            chain,
         )
         return cur.fetchone()[0]
     finally:
         conn.close()
 
 def history(where="1=1", limit=100, order_by="id DESC"):
-    """Query this session's archived messages. where/order_by are raw SQL
-    fragments over columns turn_id, role, content, ts -- scoped to this
-    session automatically, you cannot see another session's rows.
+    """Query this session's archived messages -- AND every session this
+    one is a rotation-continuation of (round 21: a gateway restart's new
+    session_id no longer hides the conversation's earlier history from
+    this call). where/order_by are raw SQL fragments over columns
+    turn_id, role, content, ts.
 
     Round-18: kept the superseded=0 filter here deliberately, argued
     explicitly rather than left as an unexamined inherited default --
@@ -105,11 +142,13 @@ def history(where="1=1", limit=100, order_by="id DESC"):
     """
     conn = sqlite3.connect(DB_PATH)
     try:
+        chain = _session_id_chain()
+        placeholders = ",".join("?" * len(chain))
         cur = conn.execute(
-            "SELECT turn_id, role, content, ts FROM rlm_messages "
-            "WHERE session_id = ? AND superseded = 0 AND (" + where + ") "
+            f"SELECT turn_id, role, content, ts FROM rlm_messages "
+            f"WHERE session_id IN ({{placeholders}}) AND superseded = 0 AND (" + where + ") "
             "ORDER BY " + order_by + " LIMIT ?",
-            (SESSION_ID, int(limit)),
+            (*chain, int(limit)),
         )
         rows = cur.fetchall()
     finally:
