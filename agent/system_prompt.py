@@ -74,6 +74,7 @@ def _ra():
     through ``run_agent`` on every call preserves the patch contract.
     """
     import run_agent
+
     return run_agent
 
 
@@ -259,7 +260,9 @@ def _restore_plugin_prompt_sections(prompt: str) -> tuple:
 
 def restore_plugin_prompt_sections(agent: Any, prompt: str) -> None:
     """Seed a resumed agent's frozen snapshot from persisted prompt bytes."""
-    agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(prompt)
+    agent._plugin_system_prompt_sections_snapshot = _restore_plugin_prompt_sections(
+        prompt
+    )
 
 
 def _plugin_section_blocks(sections: tuple, position: str) -> List[str]:
@@ -335,7 +338,9 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(
+    agent: Any, system_message: Optional[str] = None
+) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
     Returns a dict with three keys:
@@ -444,6 +449,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # macOS-only wording (Mac, Space, cmd+s).
     if "computer_use" in agent.valid_tool_names:
         from agent.prompt_builder import computer_use_guidance
+
         stable_parts.append(computer_use_guidance())
 
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
@@ -459,13 +465,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.valid_tool_names:
         _enforce = agent._tool_use_enforcement
         _inject = False
-        if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
+        if _enforce is True or (
+            isinstance(_enforce, str)
+            and _enforce.lower() in {"true", "always", "yes", "on"}
+        ):
             _inject = True
-        elif _enforce is False or (isinstance(_enforce, str) and _enforce.lower() in {"false", "never", "no", "off"}):
+        elif _enforce is False or (
+            isinstance(_enforce, str)
+            and _enforce.lower() in {"false", "never", "no", "off"}
+        ):
             _inject = False
         elif isinstance(_enforce, list):
             model_lower = (agent.model or "").lower()
-            _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
+            _inject = any(
+                p.lower() in model_lower for p in _enforce if isinstance(p, str)
+            )
         else:
             # "auto" or any unrecognised value — use hardcoded defaults
             model_lower = (agent.model or "").lower()
@@ -482,18 +496,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Also applied to xAI Grok — same failure modes (claims completion
             # without tool calls, suggests workarounds instead of using
             # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+            if (
+                "gpt" in _model_lower
+                or "codex" in _model_lower
+                or "grok" in _model_lower
+            ):
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(
         name in agent.valid_tool_names
-        for name in ['skills_list', 'skill_view', 'skill_manage', 'skill_search']
+        for name in ["skills_list", "skill_view", "skill_manage", "skill_search"]
     )
     if has_skills_tools:
         avail_toolsets = {
             toolset
             for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
+                _r.get_toolset_for_tool(tool_name)
+                for tool_name in agent.valid_tool_names
             )
             if toolset
         }
@@ -551,10 +570,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         try:
             from agent.coding_context import coding_system_prompt_parts
 
-            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = coding_system_prompt_parts(
-                platform=agent.platform,
-                cwd=resolve_context_cwd(),
-                model=agent.model,
+            coding_prefix_parts, coding_workspace_parts, coding_trailing_parts = (
+                coding_system_prompt_parts(
+                    platform=agent.platform,
+                    cwd=resolve_context_cwd(),
+                    model=agent.model,
+                )
             )
             stable_parts.extend(coding_prefix_parts)
         except Exception:
@@ -580,6 +601,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_environment_probe", True):
         try:
             from tools.env_probe import get_environment_probe_line
+
             _probe_line = get_environment_probe_line()
             if _probe_line:
                 post_workspace_parts.append(_probe_line)
@@ -602,11 +624,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 epoch_line,
                 get_bot_mode_protocol_section,
             )
+
             _title = str(getattr(agent, "_session_title_hint", "") or "").strip()
             if not _title:
                 _sdb = getattr(agent, "_session_db", None)
                 _sid = getattr(agent, "session_id", None)
-                _title = str((_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or "").strip()
+                _title = str(
+                    (_sdb.get_session_title(_sid) if (_sdb and _sid) else None) or ""
+                ).strip()
             if _title == BOT_CHAT_TITLE:
                 _bot_section = get_bot_mode_protocol_section(_agent_home(agent))
                 if _bot_section:
@@ -643,6 +668,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             active_profile = _profile_name_for_home(_agent_home_path)
         else:
             from agent.file_safety import _resolve_active_profile_name
+
             active_profile = _resolve_active_profile_name()
     except Exception:
         active_profile = "default"
@@ -699,6 +725,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Check plugin registry for platform-specific LLM guidance
         try:
             from gateway.platform_registry import platform_registry
+
             _entry = platform_registry.get(platform_key)
             if _entry and _entry.platform_hint:
                 _default_hint = _entry.platform_hint
@@ -714,16 +741,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if platform_key == "telegram" and _default_hint:
         try:
             from hermes_cli.config import load_config_readonly
+
             _cfg = load_config_readonly()
-            _gw_tg_extra = (((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram") or {}).get("extra")
-            _top_tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get("extra")
+            _gw_tg_extra = (
+                ((_cfg.get("gateway") or {}).get("platforms") or {}).get("telegram")
+                or {}
+            ).get("extra")
+            _top_tg_extra = ((_cfg.get("platforms") or {}).get("telegram") or {}).get(
+                "extra"
+            )
             if not isinstance(_gw_tg_extra, dict):
                 _gw_tg_extra = {}
             if not isinstance(_top_tg_extra, dict):
                 _top_tg_extra = {}
             _tg_extra = {**_gw_tg_extra, **_top_tg_extra}
             if _tg_extra.get("rich_messages"):
-                _default_hint = _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
+                _default_hint = (
+                    _default_hint.rstrip() + " " + TELEGRAM_RICH_MESSAGES_HINT
+                )
         except Exception:
             pass  # Config read failure — fall back to base hint only
 
@@ -758,10 +793,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # gateway daemons) self-spawns into the install tree, where the
         # fallback would inject this repo's contributor AGENTS.md (#64590).
         context_files_prompt = _r.build_context_files_prompt(
-            cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
+            cwd=resolve_context_cwd(),
+            skip_soul=_soul_loaded,
             context_length=_ctx_len,
             allow_install_tree_fallback=agent.platform in ("cli", "tui"),
-            home_override=_agent_home(agent))
+            home_override=_agent_home(agent),
+        )
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
@@ -824,6 +861,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     )
 
     from hermes_time import get_timezone as _hermes_tz, now as _hermes_now
+
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
@@ -873,8 +911,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     volatile_parts.append(timestamp_line)
 
     return {
-        "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
-        "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
+        "stable": "\n\n".join(p.strip() for p in stable_parts if p and p.strip()),
+        "context": "\n\n".join(p.strip() for p in context_parts if p and p.strip()),
         "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
     }
 
@@ -897,7 +935,9 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     the change stays in the reused prefix.
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
-    joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+    joined = "\n\n".join(
+        p for p in (parts["stable"], parts["context"], parts["volatile"]) if p
+    )
     agent._cached_system_prompt_static = parts["stable"]
 
     # Surface context-file truncation warnings through the normal agent status
@@ -959,7 +999,9 @@ def reconstruct_static_prefix(
     if getattr(agent, "_static_rebuild_failed_for", None) == stored:
         return
     try:
-        static = build_system_prompt_parts(agent, system_message=system_message)["stable"]
+        static = build_system_prompt_parts(agent, system_message=system_message)[
+            "stable"
+        ]
         if static and stored.startswith(static):
             agent._cached_system_prompt_static = static
             agent._static_rebuild_failed_for = None
@@ -991,7 +1033,7 @@ def format_tools_for_system_message(agent: Any) -> str:
             "name": func["name"],
             "description": func.get("description", ""),
             "parameters": func.get("parameters", {}),
-            "required": None  # Match the format in the example
+            "required": None,  # Match the format in the example
         }
         formatted_tools.append(formatted_tool)
 
