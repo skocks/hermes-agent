@@ -1986,7 +1986,7 @@ def _assistant_tool_call(call_id, tool_name):
 
 
 def test_prune_tool_results_only_shrinks_payloads_and_reports_correct_count(tmp_path):
-    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=2)
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=2, drop_chunk_size=1)
     engine.on_session_start("s1")
     huge = "x" * 5000
 
@@ -2016,7 +2016,7 @@ def test_prune_tool_results_only_never_touches_rlm_repl_results(tmp_path):
     never do, regardless of position -- so a raw payload can no longer
     positionally outrank a retrieval result the model already paid for.
     """
-    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1)
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1, drop_chunk_size=1)
     engine.on_session_start("s1")
     huge = "y" * 5000
 
@@ -2045,7 +2045,7 @@ def test_prune_tool_results_only_loses_nothing_from_the_archive(tmp_path):
     unrecoverable -- everything pruned must already be archived, in full,
     before the placeholder replaces it in the live transcript.
     """
-    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1)
+    engine = _make_engine(tmp_path, protect_first_n=1, protect_last_n=1, drop_chunk_size=1)
     engine.on_session_start("s1")
     huge = "z" * 5000
 
@@ -2293,3 +2293,105 @@ def test_background_review_does_not_pollute_parent_archive(tmp_path):
         "the parent's own archive must be untouched by the fork's activity"
     )
     assert engine._store.message_count("review-fork-3") == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-23: prune_tool_results_only's protected zone must match
+# select_context's actual quantized boundary, not a narrower, separately
+# invented `protect_last_n`-only window. Measured in real production
+# turns before this fix: 171 real marker-bearing turns, only 24% hit the
+# prefix cache at all; one real conversation logged six consecutive turns
+# all at 0% cached with the PROMPT SHRINKING between them despite a
+# constant message count -- substituted content at a fixed tail length,
+# not a genuine append or a genuine boundary advance. This harness test
+# is regression coverage, NOT the acceptance proof -- see round-23.md for
+# the real production replay (before: 13.3% avg cached / 16.0s avg
+# prefill; after: 94.1% avg cached / 1.9s avg prefill, same synthetic-
+# but-production-shaped conversation, real TabbyAPI turn logs).
+# ---------------------------------------------------------------------------
+
+def _tool_pair(call_id, size_chars=3000):
+    return [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": call_id, "function": {"name": "web_search"}}]},
+        {"role": "tool", "tool_call_id": call_id, "content": "x" * size_chars},
+    ]
+
+
+def test_prune_and_select_context_together_stay_append_only_at_production_scale(tmp_path):
+    """The actual bug, reproduced at real production settings
+    (protect_last_n=25, drop_chunk_size=20 -- no overrides): a growing,
+    tool-heavy conversation, with prune_tool_results_only invoked between
+    every request exactly as conversation_loop.py does. Consecutive
+    select_context() outputs must be a pure append except at a genuine
+    boundary advance.
+    """
+    engine = _make_engine(tmp_path)  # production defaults, no overrides
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = [{"role": "system", "content": "sys"}]
+    convo += [{"role": "user", "content": "start"}, {"role": "assistant", "content": "ok"}]
+    for i in range(12):
+        convo += _tool_pair(f"init{i}")
+
+    prev_outgoing = None
+    boundary_advances = 0
+    pure_append_failures = []
+    for turn in range(10):
+        convo += _tool_pair(f"turn{turn}")
+        outgoing = engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+        outgoing = outgoing if outgoing is not None else convo
+
+        if prev_outgoing is not None:
+            shorter, longer = (
+                (prev_outgoing, outgoing) if len(prev_outgoing) <= len(outgoing) else (outgoing, prev_outgoing)
+            )
+            is_pure_append = longer[: len(shorter)] == shorter
+            if len(outgoing) < len(prev_outgoing):
+                boundary_advances += 1  # a real reprefill -- shorter tail is expected here
+            elif not is_pure_append:
+                pure_append_failures.append(turn)
+        prev_outgoing = outgoing
+
+        pruned, _ = engine.prune_tool_results_only(convo)
+        if pruned is not convo:
+            convo = pruned
+
+    assert not pure_append_failures, (
+        f"turns {pure_append_failures} broke the append-only prefix without a "
+        "genuine boundary advance -- prune touched content select_context "
+        "still considered stable"
+    )
+
+
+def test_prune_tool_results_only_never_touches_the_current_stable_tail(tmp_path):
+    """Direct check on the mechanism itself, at production scale: nothing
+    prune_tool_results_only removes/shrinks can be inside
+    [head, effective boundary) -- i.e. outside what select_context is
+    currently sending -- at the moment it runs.
+    """
+    engine = _make_engine(tmp_path)  # production defaults
+    engine.on_session_start("s1")
+    engine.update_model(model="m", context_length=131072, base_url="http://x/v1", api_mode="chat_completions")
+
+    convo = [{"role": "system", "content": "sys"}]
+    convo += [{"role": "user", "content": "start"}, {"role": "assistant", "content": "ok"}]
+    for i in range(35):
+        convo += _tool_pair(f"c{i}")
+
+    # Prime the boundary via a real select_context call first.
+    engine.select_context(convo, conversation_messages=convo, budget_tokens=131072)
+    non_system_before = [m for m in convo if m.get("role") != "system"]
+    boundary = engine._effective_tail_boundary(len(non_system_before))
+    stable_ids_before = {id(m) for m in non_system_before[boundary:]}
+
+    pruned, count = engine.prune_tool_results_only(convo)
+    assert count > 0, "fixture must have qualifying prunable content outside the stable zone"
+
+    # Every message object that was part of the stable tail must appear,
+    # untouched (same object), in the pruned output.
+    pruned_ids = {id(m) for m in pruned}
+    assert stable_ids_before <= pruned_ids, (
+        "prune must not have replaced/removed any message that was part "
+        "of the currently-stable tail -- it may only touch the dropped middle"
+    )

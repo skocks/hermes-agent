@@ -610,23 +610,50 @@ class RLMContextEngine(ContextEngine):
         measured 44x prefill reduction) -- splicing a second,
         content-dependent inclusion rule into that hot, per-request path
         risks reintroducing exactly the instability round 15 spent a
-        round fixing. This hook runs on its own separate, lower-frequency
-        trigger instead: every non-rlm_repl tool-result payload outside
-        the protected tail (protect_last_n, reusing select_context's own
-        notion of "recent enough to always keep"), above
-        prune_min_result_chars, gets replaced by a short placeholder
-        pointing at rlm_repl -- content already safely archived (this
-        calls _archive_new() first, same discipline as compress()), never
-        deleted, never unrecoverable. rlm_repl's OWN results are matched
-        by tool_call_id back to the assistant message that called it and
-        are NEVER pruned, at any position -- once a raw payload can no
-        longer accumulate weight, it can no longer positionally outrank a
-        retrieval result in _select_tail()'s token-budgeted tail either.
-        The pathological case (fresh retrieval evicted before use) is
-        prevented by construction: nothing this cheap for the model to
-        re-fetch (a live web page) is ever allowed to outweigh something
-        this expensive to have fetched (an rlm_repl result), because the
-        cheap thing shrinks first.
+        round fixing. This hook runs on its own separate trigger instead:
+        every non-rlm_repl tool-result payload outside the protected
+        zone, above prune_min_result_chars, gets replaced by a short
+        placeholder pointing at rlm_repl -- content already safely
+        archived (this calls _archive_new() first, same discipline as
+        compress()), never deleted, never unrecoverable. rlm_repl's OWN
+        results are matched by tool_call_id back to the assistant message
+        that called it and are NEVER pruned, at any position.
+
+        Round-23 correction to that "protected zone", found in production
+        rather than a harness: round 18's original version protected only
+        `messages[-protect_last_n:]` -- an exact, NARROWER positional
+        slice than what select_context's OWN quantized tail actually
+        keeps stable (which spans protect_last_n to
+        protect_last_n + drop_chunk_size - 1 messages between boundary
+        advances, see _select_tail). A tool-result message could sit
+        INSIDE select_context's stable, already-being-sent tail while
+        still being OUTSIDE this hook's narrower window -- eligible for
+        pruning on every single request. Once pruned, its content
+        changed, silently breaking the byte-identical-prefix guarantee
+        round 15 exists to provide, for that message's position, on that
+        turn. Measured impact: 171 real marker-bearing production turns,
+        only 24% hit the prefix cache at all; one real conversation
+        showed six consecutive turns all at 0% cached with the PROMPT
+        SHRINKING between them despite a constant message count -- the
+        exact signature of substituted content at a fixed tail length,
+        not a genuine append or a genuine boundary advance.
+
+        Fixed by protecting the SAME zone select_context actually keeps
+        stable -- head (protect_first_n) plus everything from
+        _effective_tail_boundary(n) onward, the read-only twin of
+        _select_tail's own quantization math -- instead of a separately
+        invented, narrower guess. Anything before that boundary is
+        already excluded from every outgoing request regardless (that's
+        what "dropped" means), so pruning it has zero prefix-cache
+        impact; anything at or after it is exactly what's currently being
+        sent, so it's now off-limits here, full stop. This makes a
+        correctly-scoped prune pass cache-neutral by construction --
+        firing every request only touches content that was never going
+        to be sent this turn either way, so no separate throttle/rearm
+        hysteresis (the built-in compressor's own approach) was needed on
+        top of this to fix the measured problem, though the option
+        remains open if a different cost concern (transcript bloat over
+        a very long session) ever calls for one later.
         """
         if not self._store:
             return messages, 0
@@ -648,9 +675,18 @@ class RLMContextEngine(ContextEngine):
                 if call_id and name:
                     tool_name_by_call_id[call_id] = name
 
-        protected_tail_ids = (
-            {id(m) for m in messages[-self.protect_last_n :]} if self.protect_last_n else set()
-        )
+        # Round-23: protect exactly what select_context's own quantized
+        # boundary currently keeps stable -- head + everything from that
+        # boundary onward -- not a separately-invented, narrower window.
+        # Computed against non_system (the same population _select_tail
+        # itself reasons about), then mapped back to object identity so
+        # the actual prune loop below (which walks the full `messages`,
+        # system prompt included) can check membership cheaply.
+        non_system = [m for m in messages if m.get("role") != "system"]
+        boundary = self._effective_tail_boundary(len(non_system))
+        protected_tail_ids = {id(m) for m in non_system[: self.protect_first_n]} | {
+            id(m) for m in non_system[boundary:]
+        }
 
         new_messages: List[Dict[str, Any]] = []
         pruned_count = 0
@@ -943,15 +979,44 @@ class RLMContextEngine(ContextEngine):
         if n == 0 or self.protect_last_n <= 0:
             self._tail_boundary = n
             return []
-        min_boundary = max(0, n - self.protect_last_n)
-        quantized = (min_boundary // self._drop_chunk_size) * self._drop_chunk_size
-        boundary = min(max(self._tail_boundary, quantized), n)
+        boundary = self._effective_tail_boundary(n)
         candidates = non_system[boundary:]
         trimmed = self._bound_tail_tokens(candidates, budget_tokens)
         if len(trimmed) < len(candidates):
             boundary = n - len(trimmed)
         self._tail_boundary = boundary
         return trimmed
+
+    def _effective_tail_boundary(self, n: int) -> int:
+        """Round-23: the quantized boundary math, read-only -- what
+        _select_tail's boundary IS (or is about to become) for a
+        non-system transcript of length n, without mutating
+        self._tail_boundary (only _select_tail itself does that, since
+        it alone knows the token-cap-forced-advance case too).
+
+        Extracted so prune_tool_results_only can compute the SAME
+        boundary select_context uses, instead of a separately-invented
+        notion of "protected". That mismatch was a real, measured
+        production bug: prune_tool_results_only's own protected zone used
+        to be a plain `messages[-protect_last_n:]` slice -- exactly
+        protect_last_n messages, always, positionally. select_context's
+        actual tail is WIDER than that between boundary advances (up to
+        protect_last_n + drop_chunk_size - 1, by design -- see
+        _select_tail's own docstring). Any tool-result message sitting in
+        that gap -- inside select_context's stable, already-sent tail,
+        but outside prune's narrower window -- was eligible for pruning
+        on every single request. Once pruned, its content changed, and
+        with it the byte-identical prefix round 15 exists to guarantee.
+        Production measurement: 171 real marker-bearing turns, only 24%
+        hit the prefix cache at all; six consecutive turns in one
+        conversation all measured 0% cached with a SHRINKING prompt size
+        despite a constant message count -- the signature of exactly
+        this: different content being substituted at the same tail
+        length, not the tail actually growing or the boundary advancing.
+        """
+        min_boundary = max(0, n - self.protect_last_n)
+        quantized = (min_boundary // self._drop_chunk_size) * self._drop_chunk_size
+        return min(max(self._tail_boundary, quantized), n)
 
     def _bound_tail_tokens(
         self, candidates: List[Dict[str, Any]], budget_tokens: int
