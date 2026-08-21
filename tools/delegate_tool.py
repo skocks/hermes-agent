@@ -42,6 +42,7 @@ from agent.interrupt_compat import request_hard_interrupt
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
+from tools.agent_profiles import AgentProfileError, agent_profile_for_installed
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
@@ -970,6 +971,40 @@ def _get_child_timeout() -> Optional[float]:
     return DEFAULT_CHILD_TIMEOUT
 
 
+def _get_profile_grantable_toolsets() -> set:
+    """Toolsets a vetted agent profile may grant beyond the parent's own.
+
+    ``_build_child_agent`` intersects a profile's enabled_toolsets with the
+    parent's ("a subagent must not gain tools the parent lacks"). That guard is
+    correct for an arbitrary caller-supplied list, but it makes profiles
+    unusable on a deliberately thin root: a root carrying only
+    [clarify, context_engine, delegation, memory, skills, todo] intersects the
+    researcher profile's [web, file] down to nothing, and the child silently
+    inherits the parent's toolsets instead -- which is the opposite of what
+    naming a profile was supposed to do.
+
+    This allowlist is the operator's explicit statement that a *profile* may
+    grant these toolsets anyway. It is deliberately config-level, not
+    profile-level: a skill must not be able to widen its own privileges by
+    editing its own frontmatter. Empty by default, so behaviour is unchanged
+    until an operator opts in.
+
+    Set via delegation.profile_grantable_toolsets in config.yaml.
+    """
+    cfg = _load_config()
+    val = cfg.get("profile_grantable_toolsets")
+    if val is None:
+        return set()
+    if not isinstance(val, list):
+        logger.warning(
+            "delegation.profile_grantable_toolsets=%r is not a list; "
+            "granting nothing",
+            val,
+        )
+        return set()
+    return {str(t) for t in val}
+
+
 def _get_max_spawn_depth() -> int:
     """Read delegation.max_spawn_depth from config, floored at 1 (no ceiling).
 
@@ -1296,6 +1331,66 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     return [t for t in toolsets if t not in blocked_toolset_names]
 
 
+def _inject_allowed_memory_tools(child, allowed) -> int:
+    """Attach only the memory-provider tools an agent profile allow-listed.
+
+    ``inject_memory_provider_tools`` can't be reused here: its gate
+    (``memory_provider_tools_enabled``) returns False as soon as "memory" is in
+    disabled_toolsets, and ``_blocked_toolsets_for_role`` always puts it there
+    so the built-in MEMORY.md tool stays blocked for children. That block is
+    correct and must stay -- so the provider tools are injected explicitly
+    instead, by name, from the profile's allow-list.
+
+    An allow-list rather than a boolean because the provider exposes reads
+    (hindsight_recall) and writes (hindsight_retain) side by side: letting a
+    child recall shared knowledge is cheap and safe, letting it write durable
+    knowledge others read is a different decision. The profile author makes
+    each one explicitly.
+
+    Returns the number of tools added.
+    """
+    if not allowed:
+        return 0
+    memory_manager = getattr(child, "_memory_manager", None)
+    tools = getattr(child, "tools", None)
+    if not memory_manager or tools is None:
+        return 0
+    get_schemas = getattr(memory_manager, "get_all_tool_schemas", None)
+    if not callable(get_schemas):
+        return 0
+
+    try:
+        from agent.memory_manager import normalize_tool_schema
+    except Exception:  # pragma: no cover - import guard
+        logger.debug("delegate: normalize_tool_schema unavailable", exc_info=True)
+        return 0
+
+    allowed_names = set(allowed)
+    existing = {
+        t.get("function", {}).get("name")
+        for t in tools
+        if isinstance(t, dict)
+    }
+    valid_tool_names = getattr(child, "valid_tool_names", None)
+    if valid_tool_names is None:
+        valid_tool_names = set()
+        child.valid_tool_names = valid_tool_names
+
+    added = 0
+    for raw_schema in get_schemas():
+        schema = normalize_tool_schema(raw_schema)
+        if schema is None:
+            continue
+        name = schema["name"]
+        if name not in allowed_names or name in existing:
+            continue
+        tools.append({"type": "function", "function": schema})
+        valid_tool_names.add(name)
+        existing.add(name)
+        added += 1
+    return added
+
+
 def _blocked_toolsets_for_role(role: str) -> List[str]:
     """Return one-tool deny toolsets for a delegated child role.
 
@@ -1598,6 +1693,16 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Round 24: an agent profile's optional extras. toolsets (above) already
+    # carries enabled_toolsets when a profile is resolved by the caller;
+    # these two carry the rest of AgentProfileSpec that _build_child_agent
+    # itself has to merge into machinery it already owns (disabled-toolset
+    # assembly, system prompt construction) rather than something the
+    # caller can just pass through untouched.
+    profile_disabled_toolsets: Optional[List[str]] = None,
+    profile_system_prompt_fragment: Optional[str] = None,
+    profile_memory_tools: Optional[List[str]] = None,
+    toolsets_from_profile: bool = False,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1657,7 +1762,19 @@ def _build_child_agent(
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [t for t in toolsets if t in expanded_parent]
+        # A vetted agent profile may additionally grant toolsets the parent
+        # does not carry, but ONLY those an operator allowlisted in
+        # delegation.profile_grantable_toolsets. Without this, a deliberately
+        # thin root intersects every profile down to nothing and the child
+        # silently inherits the parent's toolsets instead -- the opposite of
+        # what naming a profile means. The escalation guard is unchanged for
+        # any non-profile caller.
+        grantable = (
+            _get_profile_grantable_toolsets() if toolsets_from_profile else set()
+        )
+        child_toolsets = [
+            t for t in toolsets if t in expanded_parent or t in grantable
+        ]
         if _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
@@ -1688,7 +1805,10 @@ def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"]
+            inherited_disabled
+            + list(profile_disabled_toolsets or [])
+            + _blocked_toolsets_for_role(effective_role)
+            + ["kanban"]
         )
     )
 
@@ -1708,6 +1828,13 @@ def _build_child_agent(
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
     )
+    # Round 24: an agent profile's system_prompt_fragment is appended last,
+    # after the depth/orchestrator note, so it reads as the most specific
+    # (profile-shaped) instruction rather than being buried under it.
+    if profile_system_prompt_fragment and profile_system_prompt_fragment.strip():
+        child_prompt = (
+            f"{child_prompt}\n\n## Agent profile\n{profile_system_prompt_fragment.strip()}"
+        )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
@@ -1954,7 +2081,15 @@ def _build_child_agent(
                 log_prefix=f"[subagent-{task_index}]",
                 platform="subagent",
                 skip_context_files=True,
-                skip_memory=True,
+                # Children normally get no external memory provider at all.
+                # A profile opts back in by allow-listing provider tools
+                # (metadata.hermes.agent.memory_tools) -- that is what lets
+                # subagents share knowledge through hindsight instead of
+                # routing every finding back through the parent's context.
+                # The built-in MEMORY.md tool stays blocked regardless: it is
+                # in DELEGATE_BLOCKED_TOOLS, and memory_enabled gates its
+                # store separately.
+                skip_memory=not profile_memory_tools,
                 clarify_callback=None,
                 thinking_callback=child_thinking_cb,
                 session_db=child_session_db,
@@ -1997,6 +2132,10 @@ def _build_child_agent(
                     pass
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Profile-allow-listed memory-provider tools. Injected explicitly rather
+    # than through inject_memory_provider_tools() -- see that helper's
+    # docstring for why its gate can't be satisfied for a delegated child.
+    _inject_allowed_memory_tools(child, profile_memory_tools)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
     # close it out from under a background child (#81267).
@@ -3616,6 +3755,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    agent: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3636,6 +3776,15 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'agent' parameter (round 24) names an installed agent-profile skill
+    (see tools/agent_profiles.py) whose enabled_toolsets/disabled_toolsets/
+    system_prompt_fragment/output_schema shape the child instead of it
+    inheriting the parent's full toolset. Optional -- omitting it preserves
+    today's behavior exactly (child inherits parent toolsets). Per-task
+    'agent' beats the top-level one, same override pattern as 'role'.
+    Unknown profile names fail the call with a clear error rather than
+    silently falling back to the unshaped default.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3666,6 +3815,11 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+
+    # Round 24: normalise the top-level agent-profile name once. Per-task
+    # overrides re-resolve below, mirroring the role pattern. An empty/
+    # whitespace-only string is treated as "no profile" (same as None).
+    top_agent = (agent or "").strip() or None
 
     # Background (async) delegation now applies to BOTH single tasks and
     # batches. A batch is dispatched as ONE async unit: the whole fan-out runs
@@ -3770,6 +3924,30 @@ def delegate_task(
         if batch_error:
             return tool_error(batch_error)
 
+    # Round 24: resolve agent profiles up front, once per distinct name, so
+    # an unknown profile fails the whole call loudly before any child is
+    # built -- same posture as the batch quality gate above, not a silent
+    # per-task partial spawn. Per-task 'agent' beats top_agent, mirroring
+    # the role override pattern.
+    task_agent_names: List[Optional[str]] = []
+    resolved_profiles: Dict[str, Any] = {}
+    for i, task in enumerate(task_list):
+        name = (task.get("agent") or top_agent or "").strip() or None
+        task_agent_names.append(name)
+        if name is None or name in resolved_profiles:
+            continue
+        try:
+            spec = agent_profile_for_installed(name)
+        except AgentProfileError as exc:
+            return tool_error(f"Task {i} agent profile '{name}' is malformed: {exc}")
+        if spec is None:
+            return tool_error(
+                f"Task {i} names unknown agent profile '{name}'. It must be "
+                f"an installed skill whose frontmatter declares "
+                f"metadata.hermes.agent.enabled_toolsets."
+            )
+        resolved_profiles[name] = spec
+
     # T1-24: coerce/validate optional per-task output_schema up front so a
     # malformed schema fails the whole call loudly instead of spawning
     # children that can never satisfy their contract. Runs AFTER the
@@ -3782,6 +3960,10 @@ def delegate_task(
         raw_schema = task.get("output_schema")
         if raw_schema is None and len(task_list) == 1 and output_schema is not None:
             raw_schema = output_schema
+        if raw_schema is None:
+            _profile = resolved_profiles.get(task_agent_names[i])
+            if _profile is not None and _profile.output_schema is not None:
+                raw_schema = _profile.output_schema
         coerced_schema, schema_err = coerce_output_schema(raw_schema)
         if schema_err:
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
@@ -3848,14 +4030,23 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Round 24: resolve this task's agent profile (already validated
+        # above; None means "no profile", unchanged default behavior).
+        _profile = resolved_profiles.get(task_agent_names[i])
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
                 goal=t["goal"],
                 context=_child_context,
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
+                # Subagents inherit the parent's toolsets by default; the
+                # model can narrow them ONLY through a named agent profile
+                # (curated, vetted skill), never an arbitrary raw list --
+                # see tools/agent_profiles.py's module docstring for why.
+                toolsets=_profile.enabled_toolsets if _profile else None,
+                profile_disabled_toolsets=_profile.disabled_toolsets if _profile else None,
+                profile_system_prompt_fragment=_profile.system_prompt_fragment if _profile else None,
+                profile_memory_tools=_profile.memory_tools if _profile else None,
+                toolsets_from_profile=_profile is not None,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -4715,6 +4906,83 @@ def _build_role_param_description() -> str:
     )
 
 
+def _build_agent_param_description() -> str:
+    """Compose the 'agent' parameter description, listing installed profiles.
+
+    Round 24: this is the discovery surface -- without naming the available
+    profiles here, the model has no way to know 'researcher' or
+    'file-auditor' exist short of already having read their skill files.
+    Best-effort: an empty or unreadable skills tree just yields the
+    no-profiles-installed fallback text rather than erroring the whole
+    schema build.
+
+    Round 25: the round-24 wording ("Optional named agent profile...
+    Installed profiles: X, Y") was informational, not directive -- the
+    model has to judge, unprompted, that a profile applies before it
+    reaches for one. Measured against 6 real production-shaped turns
+    (real model, real TabbyAPI logs, same task each time): agent="..."
+    appeared in exactly 1 of 6 generated tool calls, the other 5 built
+    tasks[] with no agent param even though the model's own reasoning
+    trace twice said aloud it should use the researcher profile, then
+    didn't. Same failure shape round 17 found for rlm_repl (0/97 calls
+    on informational phrasing) and fixed the same way: reworded from a
+    name-listing the model must decide to act on, to a directive
+    per-profile trigger condition it checks against every task before
+    building tasks[] -- "if the goal looks like X, use agent=Y" instead
+    of "here are the profiles that exist, judge for yourself".
+    """
+    specs: List[Any] = []
+    try:
+        from pathlib import Path as _Path
+
+        from tools.agent_profiles import parse_agent_profile
+        from tools.skills_hub import SKILLS_DIR
+
+        base = _Path(SKILLS_DIR)
+        seen_names = set()
+        for skill_md in base.glob("**/SKILL.md"):
+            try:
+                spec = parse_agent_profile(skill_md.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if spec is not None and spec.skill_name and spec.skill_name not in seen_names:
+                seen_names.add(spec.skill_name)
+                specs.append(spec)
+    except Exception:
+        pass
+
+    if not specs:
+        return (
+            "Optional named agent profile shaping this child's tool surface. "
+            "No agent profiles are currently installed -- omit this "
+            "parameter (default) for the child to inherit your full toolset."
+        )
+
+    trigger_lines = []
+    for spec in sorted(specs, key=lambda s: s.skill_name):
+        hint = (spec.description or "").strip()
+        if hint:
+            trigger_lines.append(f"- agent=\"{spec.skill_name}\": {hint}")
+        else:
+            trigger_lines.append(
+                f"- agent=\"{spec.skill_name}\": toolsets {spec.enabled_toolsets}"
+            )
+    triggers = "\n".join(trigger_lines)
+
+    return (
+        "CHECK THIS before building tasks[], every time, not just when "
+        "unsure: does the goal match one of the profiles below? If it "
+        "does, you MUST set agent to that name -- a matching goal built "
+        "without it inherits your full unscoped toolset and defaults to "
+        "generic instructions ('use curl', 'fetch the page') instead of "
+        "the profile's own tools and system prompt. Not matching one is "
+        "fine; leaving it unset for a matching goal is the mistake this "
+        "checks for.\n"
+        f"{triggers}\n"
+        "Omit entirely only when no profile's scope fits."
+    )
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -4731,6 +4999,7 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    overrides_params["properties"]["agent"]["description"] = _build_agent_param_description()
 
     return {
         "description": _build_top_level_description(),
@@ -4800,6 +5069,10 @@ DELEGATE_TASK_SCHEMA = {
                                 "require only fields you will actually read."
                             ),
                         },
+                        "agent": {
+                            "type": "string",
+                            "description": "Per-task agent-profile override. See top-level 'agent' for semantics.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -4811,6 +5084,10 @@ DELEGATE_TASK_SCHEMA = {
             "role": {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
+                "description": "(rebuilt at get_definitions() time)",
+            },
+            "agent": {
+                "type": "string",
                 "description": "(rebuilt at get_definitions() time)",
             },
             "output_schema": {
