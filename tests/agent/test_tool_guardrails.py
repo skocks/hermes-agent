@@ -224,3 +224,40 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
 
 
 
+
+
+class TestToolClassificationCoverage:
+    """Every tool on the root surface must be visible to the loop detector.
+
+    The no-progress detector only evaluates tools listed in
+    IDEMPOTENT_TOOL_NAMES or MUTATING_TOOL_NAMES; a tool in neither set is
+    never examined. That silent default let a subagent spin on repeated
+    skill_view calls for 182s on 2026-08-20 with hard stops enabled -- the
+    detector never looked at it.
+    """
+
+    def test_read_only_skill_and_memory_tools_are_idempotent(self):
+        from agent.tool_guardrails import IDEMPOTENT_TOOL_NAMES
+
+        for name in (
+            "skill_view",
+            "skill_search",
+            "skills_list",
+            "hindsight_recall",
+            "hindsight_reflect",
+        ):
+            assert name in IDEMPOTENT_TOOL_NAMES, name
+
+    def test_writing_tools_are_mutating(self):
+        from agent.tool_guardrails import MUTATING_TOOL_NAMES
+
+        for name in ("hindsight_retain", "rlm_repl"):
+            assert name in MUTATING_TOOL_NAMES, name
+
+    def test_no_tool_is_in_both_sets(self):
+        from agent.tool_guardrails import (
+            IDEMPOTENT_TOOL_NAMES,
+            MUTATING_TOOL_NAMES,
+        )
+
+        assert not (IDEMPOTENT_TOOL_NAMES & MUTATING_TOOL_NAMES)

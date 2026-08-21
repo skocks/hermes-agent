@@ -24,6 +24,15 @@ IDEMPOTENT_TOOL_NAMES = frozenset(
         "web_search",
         "web_extract",
         "session_search",
+        # Read-only skill and memory lookups. Unclassified until 2026-08-21,
+        # which meant the no-progress detector never evaluated them: a
+        # subagent span on repeated skill_view calls for 182s with hard stops
+        # enabled because the detector only looks at tools in these two sets.
+        "skill_view",
+        "skill_search",
+        "skills_list",
+        "hindsight_recall",
+        "hindsight_reflect",
         "browser_snapshot",
         "browser_console",
         "browser_get_images",
@@ -47,6 +56,10 @@ MUTATING_TOOL_NAMES = frozenset(
         "todo",
         "memory",
         "skill_manage",
+        # Writes durable memory / mutates REPL state, so a repeat is not a
+        # free retry even when the result looks identical.
+        "hindsight_retain",
+        "rlm_repl",
         "browser_click",
         "browser_type",
         "browser_press",
